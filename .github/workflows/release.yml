@@ -1,0 +1,59 @@
+name: Create release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish Windows release
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up 64-bit Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          architecture: x64
+
+      - name: Validate tag version
+        shell: pwsh
+        run: |
+          $tagVersion = $env:GITHUB_REF_NAME.Substring(1)
+          $appVersion = python -c "from app_version import VERSION; print(VERSION)"
+          if ($env:GITHUB_REF_TYPE -ne "tag" -or $env:GITHUB_REF_NAME -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Releases must be created from version tags such as v1.2.0."
+          }
+          if ($tagVersion -ne $appVersion.Trim()) {
+            throw "Tag version $tagVersion does not match app_version.py version $appVersion."
+          }
+
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Build release archives
+        shell: pwsh
+        run: ./build_release.ps1 -PythonCommand python
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release create $tag `
+            release/MarbleScape-source.zip `
+            release/MarbleScape-windows-x64.zip `
+            release/SHA256SUMS.txt `
+            --verify-tag `
+            --title "MarbleScape $tag" `
+            --generate-notes

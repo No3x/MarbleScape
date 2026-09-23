@@ -49,3 +49,18 @@ for rebuilding with a modified tray library.
 
 The Windows executable is not code-signed. Windows may therefore display an
 unrecognized-publisher warning.
+
+## Publishing a GitHub release
+
+Pushing a version tag such as `v1.2.0` starts the **Create release** GitHub
+Actions workflow. It checks that the tag version matches `app_version.py`,
+builds the release archives on a 64-bit Windows runner, and publishes a GitHub
+Release named `MarbleScape v1.2.0` with these assets:
+
+- `MarbleScape-source.zip`
+- `MarbleScape-windows-x64.zip`
+- `SHA256SUMS.txt`
+
+GitHub generates the release notes from commits. Create the tag only after the
+release contents have been reviewed locally; the workflow publishes the binary
+automatically.
