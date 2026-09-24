@@ -38,7 +38,8 @@ assets, so no separate icon installation is needed.
 HTTP User-Agent, and the EXE's Windows file/product version metadata.
 The build generates that metadata with `build_windows_version.py`.
 
-The executable is inside `MarbleScape-windows-x64.zip`; extract that archive
+The executable is inside `MarbleScape-windows-x64_vX.Y.Z.zip`, where `X.Y.Z`
+comes from `app_version.py`; extract that archive
 to use the new build. Building does not replace an already running installation.
 
 The build script includes the matching application source ZIP under

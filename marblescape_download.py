@@ -31,19 +31,15 @@ import xml.etree.ElementTree as ET
 from marblescape_noaa import NOAAClient
 from marblescape_himawari import HimawariClient
 from marblescape_slider import SliderClient
-from marblescape_worldview import (
-    WorldviewClient,
-    DEFAULT_PROFILE as DEFAULT_WORLDVIEW_PROFILE,
-)
+from marblescape_worldview import WorldviewClient
 from marblescape_eumetsat import (
-    DEFAULT_PROFILE as DEFAULT_EUMETSAT_PROFILE,
     normalize_profile as normalize_eumetsat_profile,
     supports_gap_fill as eumetsat_supports_gap_fill,
 )
 from marblescape_catalogues import CatalogueClient
 from marblescape_copernicus import (
     CopernicusClient,
-    DEFAULT_PROFILE as DEFAULT_COPERNICUS_PROFILE,
+    MAX_CATALOGUE_DATES,
     PROCESS_URL as COPERNICUS_PROCESS_URL,
     catalogue_revision as copernicus_catalogue_revision,
     get_layer as get_copernicus_layer,
@@ -58,6 +54,10 @@ from marblescape_profiles import (
     serialize_library,
 )
 from marblescape_cache import get_profile_image_cache, signature_digest
+from marblescape_source_defaults import (
+    AUTO_RESOLUTION_PROVIDERS,
+    default_source_profiles,
+)
 from marblescape_download_progress import (
     DOWNLOAD_PROGRESS,
     DownloadCancelledError,
@@ -300,16 +300,7 @@ BEST_PRACTICE_TEXT = (
 
 # Each image provider keeps its own selection; old configurations use EUMETSAT.
 IMAGE_SOURCE = "eumetsat"
-DEFAULT_SOURCE_PROFILES = {
-    "eumetsat": dict(DEFAULT_EUMETSAT_PROFILE),
-    "goes_east": {"area": "full_disk", "product": "GEOCOLOR", "resolution": "auto"},
-    "goes_west": {"area": "full_disk", "product": "GEOCOLOR", "resolution": "auto"},
-    "solar": {"area": "sun", "product": "Fe171", "resolution": "auto"},
-    "himawari": {"area": "nict_full_disk", "product": "true_color", "resolution": "auto"},
-    "slider": {"area": "goes-19---full_disk", "product": "geocolor", "resolution": "auto"},
-    "copernicus": dict(DEFAULT_COPERNICUS_PROFILE),
-    "worldview": dict(DEFAULT_WORLDVIEW_PROFILE),
-}
+DEFAULT_SOURCE_PROFILES = default_source_profiles()
 SOURCE_PROFILES = {key: dict(value) for key, value in DEFAULT_SOURCE_PROFILES.items()}
 CHECK_FOR_SOURCE_UPDATES = True
 SOURCE_LABELS = {
@@ -360,8 +351,13 @@ ACTIVE_PROFILE_LIBRARY_PATH = PROFILE_LIBRARY_PATH
 SET_WINDOWS_WALLPAPER = True
 
 # Windows wallpaper positioning.
-# Supported values: "center", "tile", "stretch", "fit", "fill", "span".
+# Supported values: "center", "tile", "stretch", "fit", "fill", "span", "none".
 WINDOWS_WALLPAPER_POSITION = "fit"
+WINDOWS_WALLPAPER_MONITOR_POSITIONS = {}
+WINDOWS_WALLPAPER_MONITOR_OUTPUTS = {}
+WINDOWS_WALLPAPER_LOCK = threading.RLock()
+WINDOWS_SINGLE_INSTANCE_HANDLE = None
+SKIPPED_UPDATE_VERSION = ""
 
 # Keep the console open after a fatal error when launched by double-click on
 # Windows. This has no effect on Linux or Docker.
@@ -485,6 +481,11 @@ WINDOWS_WALLPAPER_POSITIONS = {
     "fill": 4,
     "span": 5,
 }
+WALLPAPER_POSITION_CHOICES = (*WINDOWS_WALLPAPER_POSITIONS, "none")
+WALLPAPER_POSITION_LABELS = {
+    **{name: name for name in WINDOWS_WALLPAPER_POSITIONS},
+    "none": "Do not update (keep current wallpaper)",
+}
 
 APPLICATION_STOP_EVENT = threading.Event()
 FORCE_UPDATE_EVENT = threading.Event()
@@ -509,8 +510,9 @@ LOADED_CONFIGURATION_FIELDS = (
     "HISTORY_RETENTION_MONTHS", "HISTORY_RETENTION_DAYS",
     "HISTORY_RETENTION_HOURS", "HISTORY_RETENTION_MINUTES",
     "SET_WINDOWS_WALLPAPER", "WINDOWS_WALLPAPER_POSITION",
+    "WINDOWS_WALLPAPER_MONITOR_POSITIONS", "WINDOWS_WALLPAPER_MONITOR_OUTPUTS",
     "WINDOWS_PAUSE_ON_EXIT", "DISPLAY_TIME_ZONE", "LAYER_CONFIG", "ACTIVE_CONFIG_PATH",
-    "ACTIVE_PROFILE_LIBRARY_PATH",
+    "ACTIVE_PROFILE_LIBRARY_PATH", "SKIPPED_UPDATE_VERSION",
 )
 WINDOWS_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 WINDOWS_RUN_VALUE_NAME = "MarbleScape"
@@ -1059,6 +1061,20 @@ def check_github_update(current_version=VERSION):
     }
 
 
+def should_show_update_notification(result, skipped_version=""):
+    """Show only a newer published release that has not been skipped."""
+    if not result.get("update_available"):
+        return False
+    latest = result.get("latest", "")
+    url = result.get("url", "")
+    if not isinstance(url, str) or not url.startswith(PROJECT_URL + "/releases/tag/"):
+        return False
+    try:
+        return not skipped_version or version_tuple(latest) != version_tuple(skipped_version)
+    except ValueError:
+        return True
+
+
 def load_configuration(config_path):
     """Load optional user settings and update the script defaults."""
     global WMS_URL, WMS_VERSION, IMAGE_TIME, NETWORK_TIMEOUT_SECONDS
@@ -1073,7 +1089,9 @@ def load_configuration(config_path):
     global HISTORY_RETENTION_YEARS, HISTORY_RETENTION_MONTHS
     global HISTORY_RETENTION_DAYS, HISTORY_RETENTION_HOURS
     global HISTORY_RETENTION_MINUTES, SET_WINDOWS_WALLPAPER
-    global WINDOWS_WALLPAPER_POSITION, WINDOWS_PAUSE_ON_EXIT, LAYER_CONFIG
+    global WINDOWS_WALLPAPER_POSITION, WINDOWS_WALLPAPER_MONITOR_POSITIONS
+    global WINDOWS_WALLPAPER_MONITOR_OUTPUTS
+    global WINDOWS_PAUSE_ON_EXIT, LAYER_CONFIG
     global ACTIVE_CONFIG_PATH, ACTIVE_PROFILE_LIBRARY_PATH
     global IMAGE_SOURCE, SOURCE_PROFILES, CHECK_FOR_SOURCE_UPDATES, IMAGE_PROFILE_LIBRARY
     global COPERNICUS_CLIENT_ID, COPERNICUS_CLIENT_SECRET
@@ -1082,6 +1100,7 @@ def load_configuration(config_path):
     global SHOW_DOWNLOAD_SPEED, DOWNLOAD_SPEED_UNIT, SHOW_DOWNLOAD_PROGRESS
     global SHOW_DOWNLOAD_PROGRESS_BAR, KEEP_COMPLETED_DOWNLOAD_VISIBLE
     global DOWNLOAD_RETRIES, CATALOGUE_RETRIES, PROFILE_LIST_VISIBLE_COLUMNS
+    global SKIPPED_UPDATE_VERSION
 
     config_path = resolve_script_relative_path(config_path)
     ACTIVE_CONFIG_PATH = config_path
@@ -1090,7 +1109,17 @@ def load_configuration(config_path):
         if config_path != DEFAULT_CONFIG_PATH:
             raise FileNotFoundError(f"Configuration file not found: {config_path}")
         if DEFAULT_CONFIG_TEMPLATE_PATH.exists():
-            shutil.copyfile(DEFAULT_CONFIG_TEMPLATE_PATH, config_path)
+            initial_text = first_run_configuration_text(
+                DEFAULT_CONFIG_TEMPLATE_PATH.read_text(encoding="utf-8")
+            )
+            temporary = config_path.with_name(
+                f".{config_path.name}.{uuid.uuid4().hex}.tmp"
+            )
+            try:
+                temporary.write_text(initial_text, encoding="utf-8", newline="")
+                os.replace(temporary, config_path)
+            finally:
+                temporary.unlink(missing_ok=True)
             log(f"Created configuration from template: {config_path.name}")
         else:
             refresh_output_paths()
@@ -1250,7 +1279,40 @@ def load_configuration(config_path):
     WINDOWS_WALLPAPER_POSITION = str(
         windows.get("position", WINDOWS_WALLPAPER_POSITION)
     ).lower()
+    monitor_positions = windows.get("monitor_positions", {})
+    if isinstance(monitor_positions, str):
+        try:
+            monitor_positions = json.loads(monitor_positions)
+        except json.JSONDecodeError as exc:
+            raise ValueError("windows.monitor_positions is invalid JSON.") from exc
+    if not isinstance(monitor_positions, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        or value.lower() not in WALLPAPER_POSITION_CHOICES
+        for key, value in monitor_positions.items()
+    ):
+        raise ValueError("windows.monitor_positions contains invalid monitor settings.")
+    WINDOWS_WALLPAPER_MONITOR_POSITIONS = {
+        key: value.lower() for key, value in monitor_positions.items()
+    }
+    WINDOWS_WALLPAPER_MONITOR_OUTPUTS = normalize_monitor_output_settings(
+        windows.get("monitor_output_settings", {}),
+        {"width": WIDTH, "height": HEIGHT or 0, "aspect_ratio": ASPECT_RATIO,
+         "render_scale": get_render_scale_setting(), "background_color": BACKGROUND_COLOR},
+    )
     WINDOWS_PAUSE_ON_EXIT = windows.get("pause_on_error", WINDOWS_PAUSE_ON_EXIT)
+
+    updates = config.get("updates", {})
+    if not isinstance(updates, dict):
+        raise ValueError("TOML 'updates' must be a table.")
+    skipped_version = updates.get("skipped_version", "")
+    if not isinstance(skipped_version, str):
+        raise ValueError("updates.skipped_version must be a string.")
+    if skipped_version:
+        try:
+            version_tuple(skipped_version)
+        except ValueError as exc:
+            raise ValueError("updates.skipped_version is not a version tag.") from exc
+    SKIPPED_UPDATE_VERSION = skipped_version
 
     if "layers" in config:
         if not isinstance(config["layers"], list):
@@ -1269,7 +1331,9 @@ def capture_loaded_configuration():
         value = globals()[name]
         if name == "LAYER_CONFIG":
             value = [dict(entry) for entry in value]
-        elif name in {"SOURCE_PROFILES", "IMAGE_PROFILE_LIBRARY"}:
+        elif name in {"SOURCE_PROFILES", "IMAGE_PROFILE_LIBRARY",
+                      "WINDOWS_WALLPAPER_MONITOR_POSITIONS",
+                      "WINDOWS_WALLPAPER_MONITOR_OUTPUTS"}:
             value = deepcopy(value)
         state[name] = value
     return state
@@ -1281,7 +1345,9 @@ def restore_loaded_configuration(state):
         value = state[name]
         if name == "LAYER_CONFIG":
             value = [dict(entry) for entry in value]
-        elif name in {"SOURCE_PROFILES", "IMAGE_PROFILE_LIBRARY"}:
+        elif name in {"SOURCE_PROFILES", "IMAGE_PROFILE_LIBRARY",
+                      "WINDOWS_WALLPAPER_MONITOR_POSITIONS",
+                      "WINDOWS_WALLPAPER_MONITOR_OUTPUTS"}:
             value = deepcopy(value)
         globals()[name] = value
     refresh_output_paths()
@@ -1649,6 +1715,49 @@ def get_output_dimensions():
     return int(WIDTH), int(HEIGHT)
 
 
+MONITOR_OUTPUT_FIELDS = (
+    "width", "height", "aspect_ratio", "render_scale", "background_color",
+)
+
+
+def normalize_monitor_output_settings(value, defaults):
+    """Validate saved per-display overrides without requiring attached displays."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("windows.monitor_output_settings is invalid JSON.") from exc
+    if not isinstance(value, dict):
+        raise ValueError("windows.monitor_output_settings must be a monitor map.")
+    normalized = {}
+    for monitor_id, fields in value.items():
+        if not isinstance(monitor_id, str) or not monitor_id or not isinstance(fields, dict):
+            raise ValueError("Monitor output settings need a device ID and field map.")
+        if set(fields) - set(MONITOR_OUTPUT_FIELDS):
+            raise ValueError("Monitor output settings contain an unknown field.")
+        settings = dict(defaults)
+        settings.update(fields)
+        try:
+            width = int(settings["width"])
+            height = int(settings["height"])
+            ratio = normalize_aspect_ratio_text(settings["aspect_ratio"])
+            scale = parse_render_scale_setting(settings["render_scale"])
+            color = normalize_background_color(settings["background_color"])
+            actual_height = height or round(width / parse_aspect_ratio(ratio))
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError) as exc:
+            raise ValueError(f"Invalid output settings for monitor {monitor_id}.") from exc
+        if (width <= 0 or height < 0 or actual_height <= 0
+                or max(width, actual_height) > 32768
+                or width * actual_height > 33_554_432
+                or (height and abs(width / height - parse_aspect_ratio(ratio))
+                    / parse_aspect_ratio(ratio) > 0.005)):
+            raise ValueError(f"Invalid output dimensions for monitor {monitor_id}.")
+        typed = {"width": width, "height": height, "aspect_ratio": ratio,
+                 "render_scale": scale, "background_color": color}
+        normalized[monitor_id] = {key: typed[key] for key in fields}
+    return normalized
+
+
 def get_render_dimensions(output_width, output_height):
     """Return capped WMS dimensions and the effective supersampling factor."""
     maximum_scale = min(
@@ -1871,10 +1980,13 @@ def validate_configuration():
             "At least one time-based history retention value must be greater than zero."
         )
 
-    if WINDOWS_WALLPAPER_POSITION.lower() not in WINDOWS_WALLPAPER_POSITIONS:
+    if WINDOWS_WALLPAPER_POSITION.lower() not in WALLPAPER_POSITION_CHOICES:
         raise ValueError(
             f"Unsupported WINDOWS_WALLPAPER_POSITION: {WINDOWS_WALLPAPER_POSITION}"
         )
+    if any(value not in WALLPAPER_POSITION_CHOICES
+           for value in WINDOWS_WALLPAPER_MONITOR_POSITIONS.values()):
+        raise ValueError("Unsupported monitor wallpaper position.")
 
     get_output_dimensions()
 
@@ -3301,6 +3413,11 @@ class GUID(ctypes.Structure):
         return cls.from_buffer_copy(uuid.UUID(value).bytes_le)
 
 
+class WindowsRect(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
 def check_hresult(result, operation):
     if result < 0:
         unsigned = result & 0xFFFFFFFF
@@ -3376,11 +3493,368 @@ def with_windows_com(callback):
             ole32.CoUninitialize()
 
 
+def list_windows_wallpaper_monitors():
+    if os.name != "nt":
+        return []
+
+    def read_monitors():
+        desktop = create_desktop_wallpaper_interface()
+        try:
+            get_count = get_com_method(desktop, 6, ctypes.c_long,
+                                       ctypes.POINTER(ctypes.c_uint))
+            get_id = get_com_method(desktop, 5, ctypes.c_long, ctypes.c_uint,
+                                    ctypes.POINTER(ctypes.c_void_p))
+            get_rect = get_com_method(desktop, 7, ctypes.c_long, ctypes.c_wchar_p,
+                                      ctypes.POINTER(WindowsRect))
+            free_memory = ctypes.windll.ole32.CoTaskMemFree
+            free_memory.argtypes = [ctypes.c_void_p]
+            free_memory.restype = None
+            count = ctypes.c_uint()
+            check_hresult(get_count(desktop, ctypes.byref(count)),
+                          "IDesktopWallpaper.GetMonitorDevicePathCount")
+            monitors = []
+            for index in range(count.value):
+                raw_id = ctypes.c_void_p()
+                check_hresult(get_id(desktop, index, ctypes.byref(raw_id)),
+                              "IDesktopWallpaper.GetMonitorDevicePathAt")
+                try:
+                    monitor_id = ctypes.wstring_at(raw_id.value)
+                finally:
+                    free_memory(raw_id)
+                rectangle = WindowsRect()
+                result = get_rect(desktop, monitor_id, ctypes.byref(rectangle))
+                if result == 1 or result == ctypes.c_long(0x80004005).value:
+                    continue
+                check_hresult(result, "IDesktopWallpaper.GetMonitorRECT")
+                if rectangle.right <= rectangle.left or rectangle.bottom <= rectangle.top:
+                    continue
+                monitors.append({
+                    "id": monitor_id,
+                    "rect": (rectangle.left, rectangle.top,
+                             rectangle.right, rectangle.bottom),
+                })
+            return monitors
+        finally:
+            release_com_pointer(desktop)
+
+    return with_windows_com(read_monitors)
+
+
+def acquire_windows_single_instance(wait_seconds=0):
+    global WINDOWS_SINGLE_INSTANCE_HANDLE
+    if os.name != "nt":
+        return True
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                       ctypes.c_wchar_p]
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    deadline = time.monotonic() + max(0, float(wait_seconds))
+    while True:
+        handle = kernel32.CreateMutexW(
+            None, False, "Global\\Gittegatt.MarbleScape.7A87D1D4-80E9-4F7E-91EC-DF10A4969899"
+        )
+        error = ctypes.get_last_error()
+        if handle and error != 183:
+            WINDOWS_SINGLE_INSTANCE_HANDLE = handle
+            return True
+        if handle:
+            kernel32.CloseHandle(handle)
+        elif error != 5:
+            raise ctypes.WinError(error)
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(max(0, min(0.1, deadline - time.monotonic())))
+
+
+def compose_monitor_wallpaper(source, mode, rect, all_rects, background_color):
+    from PIL import Image
+
+    width, height = rect[2] - rect[0], rect[3] - rect[1]
+    if width <= 0 or height <= 0:
+        raise ValueError("Monitor dimensions must be positive.")
+    if mode == "span":
+        left = min(item[0] for item in all_rects)
+        top = min(item[1] for item in all_rects)
+        right = max(item[2] for item in all_rects)
+        bottom = max(item[3] for item in all_rects)
+        span_width, span_height = right - left, bottom - top
+        # Crop in source coordinates before resizing to avoid a full virtual-desktop buffer.
+        source_box = ((rect[0] - left) * source.width / span_width,
+                      (rect[1] - top) * source.height / span_height,
+                      (rect[2] - left) * source.width / span_width,
+                      (rect[3] - top) * source.height / span_height)
+        return source.crop(source_box).resize((width, height), Image.Resampling.LANCZOS)
+    if mode == "stretch":
+        return source.resize((width, height), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", (width, height), background_color)
+    if mode == "tile":
+        for y in range(0, height, source.height):
+            for x in range(0, width, source.width):
+                canvas.paste(source, (x, y))
+        return canvas
+    if mode == "center":
+        canvas.paste(source, ((width - source.width) // 2,
+                              (height - source.height) // 2))
+        return canvas
+    scale = (min if mode == "fit" else max)(
+        width / source.width, height / source.height
+    )
+    rendered = source.resize((max(1, round(source.width * scale)),
+                              max(1, round(source.height * scale))),
+                             Image.Resampling.LANCZOS)
+    canvas.paste(rendered, ((width - rendered.width) // 2,
+                            (height - rendered.height) // 2))
+    return canvas
+
+
+def render_monitor_output_source(source, settings):
+    """Size the shared image for one display using available source pixels."""
+    from PIL import Image
+
+    width = settings["width"]
+    height = settings["height"] or round(width / parse_aspect_ratio(settings["aspect_ratio"]))
+    target_size = (width, height)
+    if source.size == target_size:
+        return source
+    quality = settings["render_scale"]
+    if quality == "auto":
+        sample_size = source.size
+    else:
+        sample_size = (
+            min(source.width, max(width, round(width * min(quality, source.width / width)))),
+            min(source.height, max(height, round(height * min(quality, source.height / height)))),
+        )
+    if sample_size == source.size:
+        return source.resize(target_size, Image.Resampling.LANCZOS)
+    sampled = source.resize(sample_size, Image.Resampling.LANCZOS)
+    try:
+        return sampled.resize(target_size, Image.Resampling.LANCZOS)
+    finally:
+        sampled.close()
+
+
+def previous_wallpaper_backup(monitor_id):
+    directory = CONTENT_DIR / "previous_wallpapers"
+    stem = hashlib.sha256(monitor_id.encode("utf-8")).hexdigest()
+    for extension in (".png", ".jpg", ".bmp", ".tif", ".webp"):
+        candidate = directory / (stem + extension)
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def capture_previous_wallpapers(monitors, image_path):
+    """Keep each display's current image before MarbleScape replaces it."""
+    monitors = [monitor for monitor in monitors
+                if previous_wallpaper_backup(monitor["id"]) is None]
+    if not monitors:
+        return
+
+    def capture():
+        desktop = create_desktop_wallpaper_interface()
+        try:
+            get_wallpaper = get_com_method(
+                desktop, 4, ctypes.c_long, ctypes.c_wchar_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            free_memory = ctypes.windll.ole32.CoTaskMemFree
+            free_memory.argtypes = [ctypes.c_void_p]
+            free_memory.restype = None
+            directory = CONTENT_DIR / "previous_wallpapers"
+            for monitor in monitors:
+                monitor_id = monitor["id"]
+                raw_path = ctypes.c_void_p()
+                try:
+                    result = get_wallpaper(desktop, monitor_id, ctypes.byref(raw_path))
+                    check_hresult(result, "IDesktopWallpaper.GetWallpaper")
+                    if result != 0:
+                        continue
+                    current_path = ctypes.wstring_at(raw_path.value) if raw_path.value else ""
+                finally:
+                    if raw_path.value:
+                        free_memory(raw_path)
+
+                extension = ".png"
+                if current_path:
+                    source = Path(current_path)
+                    resolved = source.resolve()
+                    managed_dir = (CONTENT_DIR / "device_wallpapers").resolve()
+                    if (resolved == Path(image_path).resolve()
+                            or resolved.is_relative_to(managed_dir)
+                            or source.name.lower().startswith("marblescape_")):
+                        continue
+                    from PIL import Image
+
+                    with Image.open(source) as picture:
+                        extension = {
+                            "PNG": ".png", "JPEG": ".jpg", "BMP": ".bmp",
+                            "TIFF": ".tif", "WEBP": ".webp",
+                        }.get(picture.format)
+                    if extension is None:
+                        raise ValueError("Unsupported previous wallpaper image format.")
+                else:
+                    get_color = get_com_method(
+                        desktop, 9, ctypes.c_long, ctypes.POINTER(ctypes.c_uint32),
+                    )
+                    color = ctypes.c_uint32()
+                    check_hresult(get_color(desktop, ctypes.byref(color)),
+                                  "IDesktopWallpaper.GetBackgroundColor")
+
+                directory.mkdir(parents=True, exist_ok=True)
+                stem = hashlib.sha256(monitor_id.encode("utf-8")).hexdigest()
+                destination = directory / (stem + extension)
+                temporary = directory / (stem + ".tmp")
+                try:
+                    if current_path:
+                        shutil.copyfile(source, temporary)
+                    else:
+                        from PIL import Image
+
+                        left, top, right, bottom = monitor["rect"]
+                        value = color.value
+                        background = Image.new(
+                            "RGB", (right - left, bottom - top),
+                            (value & 255, (value >> 8) & 255, (value >> 16) & 255),
+                        )
+                        try:
+                            background.save(temporary, format="PNG")
+                        finally:
+                            background.close()
+                    os.replace(temporary, destination)
+                finally:
+                    temporary.unlink(missing_ok=True)
+        finally:
+            release_com_pointer(desktop)
+
+    with_windows_com(capture)
+
+
+def restore_previous_wallpaper(monitor_id):
+    """Restore one connected display and stop future updates to it."""
+    global WINDOWS_WALLPAPER_MONITOR_POSITIONS
+    with WINDOWS_WALLPAPER_LOCK:
+        backup = previous_wallpaper_backup(monitor_id)
+        if backup is None:
+            raise FileNotFoundError(
+                "No previous wallpaper was saved for this display. MarbleScape "
+                "cannot recover a wallpaper replaced before this feature was installed."
+            )
+        if monitor_id not in {monitor["id"] for monitor in list_windows_wallpaper_monitors()}:
+            raise ValueError("The selected display is no longer connected.")
+
+        previous_positions = dict(WINDOWS_WALLPAPER_MONITOR_POSITIONS)
+        updated_positions = {**previous_positions, monitor_id: "none"}
+        update_active_configuration(lambda text: replace_toml_section_value(
+            text, "windows", "monitor_positions", json.dumps(updated_positions),
+        ))
+        WINDOWS_WALLPAPER_MONITOR_POSITIONS = updated_positions
+
+        def restore():
+            desktop = create_desktop_wallpaper_interface()
+            try:
+                set_wallpaper = get_com_method(
+                    desktop, 3, ctypes.c_long, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                )
+                check_hresult(
+                    set_wallpaper(desktop, monitor_id, str(backup.resolve())),
+                    "IDesktopWallpaper.SetWallpaper",
+                )
+            finally:
+                release_com_pointer(desktop)
+
+        try:
+            with_windows_com(restore)
+        except Exception as restore_error:
+            WINDOWS_WALLPAPER_MONITOR_POSITIONS = previous_positions
+            try:
+                update_active_configuration(lambda text: replace_toml_section_value(
+                    text, "windows", "monitor_positions", json.dumps(previous_positions),
+                ))
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    f"{restore_error} Configuration rollback also failed: "
+                    f"{rollback_error}"
+                ) from restore_error
+            raise
+
+
 def set_windows_wallpaper(image_path):
+    with WINDOWS_WALLPAPER_LOCK:
+        _set_windows_wallpaper_unlocked(image_path)
+
+
+def _set_windows_wallpaper_unlocked(image_path):
     if os.name != "nt":
         return
 
-    position = WINDOWS_WALLPAPER_POSITIONS[WINDOWS_WALLPAPER_POSITION.lower()]
+    position_name = WINDOWS_WALLPAPER_POSITION.lower()
+    monitor_positions = {
+        monitor_id: mode for monitor_id, mode in WINDOWS_WALLPAPER_MONITOR_POSITIONS.items()
+        if mode != position_name
+    }
+    monitor_outputs = {
+        monitor_id: values for monitor_id, values in WINDOWS_WALLPAPER_MONITOR_OUTPUTS.items()
+        if values
+    }
+    if position_name == "none" and not monitor_positions:
+        return
+    monitors = list_windows_wallpaper_monitors()
+    if (monitor_positions or monitor_outputs) and not monitors:
+        raise RuntimeError("No connected display could be identified for per-display wallpaper settings.")
+    per_display = bool(monitors and (monitor_positions or monitor_outputs))
+    selected = [monitor for monitor in monitors
+                if monitor_positions.get(monitor["id"], position_name) != "none"]
+    if per_display and not selected:
+        return
+    for monitor in selected:
+        try:
+            capture_previous_wallpapers([monitor], image_path)
+        except Exception as exc:
+            log(f"Unable to save previous wallpaper: {exc}")
+    position = WINDOWS_WALLPAPER_POSITIONS.get(position_name, 2)
+    device_files = {}
+    if per_display:
+        from PIL import Image
+
+        target_dir = CONTENT_DIR / "device_wallpapers"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        with Image.open(image_path) as image:
+            source = image.convert("RGB")
+        try:
+            rects = [monitor["rect"] for monitor in monitors]
+            for monitor in selected:
+                monitor_id = monitor["id"]
+                mode = monitor_positions.get(monitor_id, position_name)
+                settings = {
+                    "width": WIDTH, "height": HEIGHT or 0,
+                    "aspect_ratio": ASPECT_RATIO,
+                    "render_scale": get_render_scale_setting(),
+                    "background_color": BACKGROUND_COLOR,
+                }
+                settings.update(monitor_outputs.get(monitor_id, {}))
+                monitor_source = render_monitor_output_source(source, settings)
+                try:
+                    composed = compose_monitor_wallpaper(
+                        monitor_source, mode, monitor["rect"], rects,
+                        parse_background_color(settings["background_color"]),
+                    )
+                finally:
+                    if monitor_source is not source:
+                        monitor_source.close()
+                filename = hashlib.sha256(monitor_id.encode("utf-8")).hexdigest()[:16] + ".png"
+                output_file = target_dir / filename
+                temporary = output_file.with_suffix(".tmp")
+                try:
+                    composed.save(temporary, format="PNG")
+                    os.replace(temporary, output_file)
+                finally:
+                    temporary.unlink(missing_ok=True)
+                    composed.close()
+                device_files[monitor_id] = output_file
+        finally:
+            source.close()
 
     def apply_wallpaper():
         desktop_wallpaper = None
@@ -3402,15 +3876,34 @@ def set_windows_wallpaper(image_path):
                 ctypes.c_long,
                 ctypes.c_int,
             )
-
+            target_position = 2 if device_files else position
+            if device_files and len(selected) < len(monitors):
+                get_position = get_com_method(
+                    desktop_wallpaper, 11, ctypes.c_long,
+                    ctypes.POINTER(ctypes.c_int),
+                )
+                current_position = ctypes.c_int()
+                check_hresult(
+                    get_position(desktop_wallpaper, ctypes.byref(current_position)),
+                    "IDesktopWallpaper.GetPosition",
+                )
+                if current_position.value in range(5):
+                    target_position = current_position.value
             check_hresult(
-                set_position(desktop_wallpaper, position),
+                set_position(desktop_wallpaper, target_position),
                 "IDesktopWallpaper.SetPosition",
             )
-            check_hresult(
-                set_wallpaper(desktop_wallpaper, None, str(image_path.resolve())),
-                "IDesktopWallpaper.SetWallpaper",
-            )
+            if device_files:
+                for monitor_id, output_file in device_files.items():
+                    check_hresult(
+                        set_wallpaper(desktop_wallpaper, monitor_id, str(output_file.resolve())),
+                        "IDesktopWallpaper.SetWallpaper",
+                    )
+            else:
+                check_hresult(
+                    set_wallpaper(desktop_wallpaper, None, str(image_path.resolve())),
+                    "IDesktopWallpaper.SetWallpaper",
+                )
         finally:
             release_com_pointer(desktop_wallpaper)
 
@@ -3503,7 +3996,7 @@ def warm_public_catalogues():
     client = get_catalogue_client()
     def worker():
         try:
-            result = client.refresh_all_catalogues(refresh=True)
+            result = client.refresh_all_catalogues(refresh=True, startup=True)
             if result.get("errors"):
                 log("Catalogue refresh: " + "; ".join(result["errors"]))
         except Exception as exc:
@@ -3514,7 +4007,13 @@ def warm_public_catalogues():
                 try:
                     profile = SOURCE_PROFILES["copernicus"]
                     output_size = get_output_dimensions()
-                    dates = get_copernicus_client().list_dates(profile, output_size)
+                    cached = client.cached_copernicus_dates(profile, output_size)
+                    since = cached[0] if cached else None
+                    dates = get_copernicus_client().list_dates(
+                        profile, output_size, since=since
+                    )
+                    if cached:
+                        dates = sorted(set(cached) | set(dates), reverse=True)[:MAX_CATALOGUE_DATES]
                     client.store_copernicus_dates(profile, output_size, dates)
                     problem = None
                     break
@@ -3564,11 +4063,46 @@ def choose_automatic_source_resolution(client, provider, profile, output_size,
     return selected[0]
 
 
+def automatic_source_output_size(output_size):
+    """Cover the configured image and every active Windows display."""
+    width, height = map(int, output_size)
+    if os.name != "nt" or not SET_WINDOWS_WALLPAPER:
+        return width, height
+    try:
+        monitors = list_windows_wallpaper_monitors()
+    except Exception as exc:
+        log(f"Unable to size automatic source resolution for monitors: {exc}")
+        return width, height
+    if len(monitors) < 2:
+        return width, height
+    display_width = display_height = 0
+    for monitor in monitors:
+        monitor_id = monitor["id"]
+        if WINDOWS_WALLPAPER_MONITOR_POSITIONS.get(
+            monitor_id, WINDOWS_WALLPAPER_POSITION
+        ) == "none":
+            continue
+        left, top, right, bottom = monitor["rect"]
+        display_width = max(display_width, right - left)
+        display_height = max(display_height, bottom - top)
+        output = WINDOWS_WALLPAPER_MONITOR_OUTPUTS.get(monitor_id, {})
+        if output:
+            device_width = int(output.get("width", WIDTH))
+            device_height = int(output.get("height", HEIGHT or 0))
+            device_ratio = parse_aspect_ratio(output.get("aspect_ratio", ASPECT_RATIO))
+            display_width = max(display_width, device_width)
+            display_height = max(
+                display_height, device_height or round(device_width / device_ratio)
+            )
+    return (display_width, display_height) if display_width and display_height else (width, height)
+
+
 def _resolved_profile_resolution(client, provider, profile, output_size):
     if profile["resolution"] != "auto":
         return profile["resolution"]
     return choose_automatic_source_resolution(
-        client, provider, profile, output_size, VIEW_MODE, ZOOM
+        client, provider, profile, automatic_source_output_size(output_size),
+        VIEW_MODE, ZOOM,
     )
 
 
@@ -3649,7 +4183,7 @@ def copernicus_frame_signature(frame):
         profile["product"], profile["layer"], profile["date"],
         profile["latitude"], profile["longitude"], profile["map_zoom"],
         profile["map_labels"], profile["coverage_mode"], profile["lookback_days"],
-        profile["max_cloud_cover"],
+        profile["max_cloud_cover"], profile["brightness"],
         frame["timestamp"],
     )
 
@@ -4528,6 +5062,10 @@ def main(argv=None, configuration_loaded=False, status_callback=None):
                 wallpaper_position_pending = (
                     SET_WINDOWS_WALLPAPER and (
                         WINDOWS_WALLPAPER_POSITION != previous_configuration["WINDOWS_WALLPAPER_POSITION"]
+                        or WINDOWS_WALLPAPER_MONITOR_POSITIONS != previous_configuration[
+                            "WINDOWS_WALLPAPER_MONITOR_POSITIONS"]
+                        or WINDOWS_WALLPAPER_MONITOR_OUTPUTS != previous_configuration[
+                            "WINDOWS_WALLPAPER_MONITOR_OUTPUTS"]
                         or not previous_configuration["SET_WINDOWS_WALLPAPER"]
                     )
                 )
@@ -5187,6 +5725,13 @@ def ensure_profile_list_configuration_section(text):
     return text.rstrip() + newline * 2 + "[profile_list]" + newline
 
 
+def ensure_updates_configuration_section(text):
+    if re.search(r"(?m)^\s*\[updates\]\s*(?:#[^\r\n]*)?$", text):
+        return text
+    newline = "\r\n" if "\r\n" in text else "\n"
+    return text.rstrip() + newline * 2 + "[updates]" + newline
+
+
 def source_configuration_updates(provider, profiles, check_for_updates=None):
     provider, profiles = normalize_source_configuration(provider, profiles)
     updates = [("source", "provider", provider)]
@@ -5209,6 +5754,19 @@ def replace_source_configuration(text, provider, profiles, check_for_updates=Non
         if not re.search(rf"(?m)^\s*\[{re.escape(section)}\]\s*(?:#[^\r\n]*)?$", text):
             text = text.rstrip() + newline * 2 + f"[{section}]" + newline
         text = replace_toml_section_value(text, section, key, value)
+    return text
+
+
+def first_run_configuration_text(template_text):
+    """Start every source with an automatic resolution on a fresh install."""
+    text = template_text
+    newline = "\r\n" if "\r\n" in text else "\n"
+    for provider in AUTO_RESOLUTION_PROVIDERS:
+        section = f"sources.{provider}"
+        if not re.search(rf"(?m)^\s*\[{re.escape(section)}\]\s*(?:#[^\r\n]*)?$", text):
+            text = text.rstrip() + newline * 2 + f"[{section}]" + newline
+        text = replace_toml_section_value(text, section, "resolution", "auto")
+    tomllib.loads(text)
     return text
 
 
@@ -5326,8 +5884,20 @@ def normalize_settings_form_values(values, provider=None):
         values.get("catalogue_retries", CATALOGUE_RETRIES)
     )
 
-    if position not in WINDOWS_WALLPAPER_POSITIONS:
+    if position not in WALLPAPER_POSITION_CHOICES:
         raise ValueError("Wallpaper position is invalid.")
+    monitor_positions = values.get("monitor_positions", WINDOWS_WALLPAPER_MONITOR_POSITIONS)
+    if not isinstance(monitor_positions, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        or value not in WALLPAPER_POSITION_CHOICES
+        for key, value in monitor_positions.items()
+    ):
+        raise ValueError("Monitor wallpaper positions are invalid.")
+    monitor_outputs = normalize_monitor_output_settings(
+        values.get("monitor_output_settings", WINDOWS_WALLPAPER_MONITOR_OUTPUTS),
+        {"width": width, "height": height, "aspect_ratio": aspect_ratio,
+         "render_scale": render_scale, "background_color": background_color},
+    )
     if is_wms and view_preset not in VIEW_PRESETS:
         raise ValueError("View preset is invalid.")
     if is_wms and projection_name not in PROJECTIONS:
@@ -5373,6 +5943,8 @@ def normalize_settings_form_values(values, provider=None):
     updates = (
         ("windows", "set_wallpaper", bool(values["set_wallpaper"])),
         ("windows", "position", position),
+        ("windows", "monitor_positions", json.dumps(monitor_positions, sort_keys=True)),
+        ("windows", "monitor_output_settings", json.dumps(monitor_outputs, sort_keys=True)),
         ("display", "time_zone", display_time_zone),
         ("view", "preset", view_preset),
         ("view", "projection", projection_name),
@@ -6064,11 +6636,101 @@ def run_with_windows_tray(argv=None):
         except Exception:
             log(f"{title}: {error}")
 
+    def run_update_notice_dialog(release):
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+
+        root = create_tray_dialog_root(tk)
+        apply_tk_window_icon(root)
+        original_destroy = root.destroy
+
+        def destroy_notice():
+            icons = getattr(root, "_marblescape_window_icons", [])
+            root._marblescape_window_icons = []
+            icons.clear()
+            original_destroy()
+
+        root.destroy = destroy_notice
+        root.protocol("WM_DELETE_WINDOW", destroy_notice)
+        root.withdraw()
+        root.title("MarbleScape update available")
+        root.resizable(False, False)
+        frame = ttk.Frame(root, padding=16)
+        frame.grid(row=0, column=0, sticky="nsew")
+        ttk.Label(
+            frame, text="A new MarbleScape version is available.",
+            font=("TkDefaultFont", 10, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(
+            frame,
+            text=f"Installed: v{VERSION.lstrip('v')}    Latest: {release['latest']}",
+        ).grid(row=1, column=0, columnspan=2, pady=(6, 12), sticky="w")
+
+        def skip_version():
+            global SKIPPED_UPDATE_VERSION
+            try:
+                update_active_configuration(
+                    lambda text: replace_toml_section_value(
+                        ensure_updates_configuration_section(text),
+                        "updates", "skipped_version", release["latest"],
+                    )
+                )
+                SKIPPED_UPDATE_VERSION = release["latest"]
+            except Exception as exc:
+                messagebox.showerror("Unable to skip this version", str(exc), parent=root)
+                return
+            root.destroy()
+
+        def open_release():
+            try:
+                if not webbrowser.open(release["url"], new=2):
+                    raise RuntimeError("The web browser could not be opened.")
+            except Exception as exc:
+                messagebox.showerror("Unable to open GitHub", str(exc), parent=root)
+                return
+            root.destroy()
+
+        ttk.Button(frame, text="Skip this version", command=skip_version).grid(
+            row=2, column=0, padx=(0, 8), sticky="ew"
+        )
+        ttk.Button(frame, text="Open GitHub", command=open_release).grid(
+            row=2, column=1, sticky="ew"
+        )
+        root.update_idletasks()
+        root.geometry(
+            f"+{max(0, (root.winfo_screenwidth() - root.winfo_reqwidth()) // 2)}"
+            f"+{max(0, (root.winfo_screenheight() - root.winfo_reqheight()) // 2)}"
+        )
+        root.deiconify()
+        root.attributes("-topmost", True)
+        root.after(250, lambda: root.attributes("-topmost", False))
+        root.mainloop()
+
+    def check_for_startup_update():
+        def worker():
+            try:
+                release = check_github_update()
+            except Exception as exc:
+                log(f"GitHub update check warning: {exc}")
+                return
+            if (APPLICATION_STOP_EVENT.is_set() or not
+                    should_show_update_notification(release, SKIPPED_UPDATE_VERSION)):
+                return
+            try:
+                run_update_notice_dialog(release)
+            except Exception as exc:
+                log(f"Unable to show update notice: {exc}")
+
+        threading.Thread(
+            target=worker, name="MarbleScapeStartupUpdate", daemon=True,
+        ).start()
+
     def restart_from_tray(icon):
         try:
             restart_environment = os.environ.copy()
             if getattr(sys, "frozen", False):
                 restart_environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+            restart_environment["MARBLESCAPE_RESTART_WAIT"] = "1"
 
             subprocess.Popen(
                 [
@@ -6516,6 +7178,7 @@ def run_with_windows_tray(argv=None):
         variables = {
             "set_wallpaper": tk.BooleanVar(value=SET_WINDOWS_WALLPAPER),
             "position": tk.StringVar(value=WINDOWS_WALLPAPER_POSITION),
+            "output_device": tk.StringVar(value="All monitors"),
             "start_with_windows": tk.BooleanVar(
                 value=is_windows_startup_enabled()
             ),
@@ -7040,6 +7703,98 @@ def run_with_windows_tray(argv=None):
             except NameError:
                 pass
 
+        try:
+            output_monitors = list_windows_wallpaper_monitors()
+        except Exception as exc:
+            log(f"Unable to list output devices: {exc}")
+            output_monitors = []
+        output_device_ids = {"All monitors": None}
+        for index, monitor in enumerate(output_monitors, start=1):
+            left, top, right, bottom = monitor["rect"]
+            label = f"Display {index} ({right - left} x {bottom - top})"
+            output_device_ids[label] = monitor["id"]
+        monitor_positions_draft = dict(WINDOWS_WALLPAPER_MONITOR_POSITIONS)
+        monitor_outputs_draft = deepcopy(WINDOWS_WALLPAPER_MONITOR_OUTPUTS)
+        global_position_draft = {"value": WINDOWS_WALLPAPER_POSITION}
+        global_output_draft = {
+            key: variables[key].get() for key in MONITOR_OUTPUT_FIELDS
+        }
+        switching_output_device = {"active": False}
+        active_output_device = {"id": None}
+        position_display = tk.StringVar(
+            value=WALLPAPER_POSITION_LABELS[variables["position"].get()]
+        )
+
+        def update_position_display(*_args):
+            position_display.set(WALLPAPER_POSITION_LABELS[variables["position"].get()])
+
+        variables["position"].trace_add("write", update_position_display)
+
+        def select_output_device(_event=None):
+            monitor_id = output_device_ids[variables["output_device"].get()]
+            restore_wallpaper_button.configure(
+                state="normal" if monitor_id is not None else "disabled"
+            )
+            switching_output_device["active"] = True
+            try:
+                active_output_device["id"] = monitor_id
+                variables["position"].set(
+                    monitor_positions_draft.get(monitor_id, global_position_draft["value"])
+                    if monitor_id else global_position_draft["value"]
+                )
+                overrides = monitor_outputs_draft.get(monitor_id, {}) if monitor_id else {}
+                for key in MONITOR_OUTPUT_FIELDS:
+                    variables[key].set(str(overrides.get(key, global_output_draft[key])))
+            finally:
+                switching_output_device["active"] = False
+
+        def select_wallpaper_position(*_args):
+            if switching_output_device["active"]:
+                return
+            monitor_id = active_output_device["id"]
+            value = variables["position"].get()
+            if monitor_id:
+                if value == global_position_draft["value"]:
+                    monitor_positions_draft.pop(monitor_id, None)
+                else:
+                    monitor_positions_draft[monitor_id] = value
+            else:
+                global_position_draft["value"] = value
+
+        def select_monitor_output_setting(key):
+            if switching_output_device["active"]:
+                return
+            monitor_id = active_output_device["id"]
+            if monitor_id is None:
+                global_output_draft[key] = variables[key].get()
+                return
+            overrides = monitor_outputs_draft.setdefault(monitor_id, {})
+            keys = ("width", "height", "aspect_ratio") if key in {
+                "width", "height", "aspect_ratio"
+            } else (key,)
+            if len(keys) == 3:
+                if all(variables[field].get() == str(global_output_draft[field])
+                       for field in keys):
+                    for field in keys:
+                        overrides.pop(field, None)
+                else:
+                    for field in keys:
+                        overrides[field] = variables[field].get()
+            else:
+                value = variables[key].get()
+                if value == str(global_output_draft[key]):
+                    overrides.pop(key, None)
+                else:
+                    overrides[key] = value
+            if not overrides:
+                monitor_outputs_draft.pop(monitor_id, None)
+
+        variables["position"].trace_add("write", select_wallpaper_position)
+        for key in MONITOR_OUTPUT_FIELDS:
+            variables[key].trace_add(
+                "write", lambda *_args, field=key: select_monitor_output_setting(field)
+            )
+
         wallpaper_frame = ttk.LabelFrame(general_tab, text="Wallpaper", padding=8)
         wallpaper_frame.grid(row=1, column=0, pady=(0, 8), sticky="ew")
         ttk.Checkbutton(
@@ -7047,24 +7802,17 @@ def run_with_windows_tray(argv=None):
             text="Set wallpaper automatically",
             variable=variables["set_wallpaper"],
         ).grid(row=0, column=0, columnspan=2, pady=3, sticky="w")
-        add_combo(
-            wallpaper_frame,
-            1,
-            "Position",
-            variables["position"],
-            tuple(WINDOWS_WALLPAPER_POSITIONS),
-        )
         ttk.Checkbutton(
             wallpaper_frame,
             text="Start with Windows",
             variable=variables["start_with_windows"],
-        ).grid(row=2, column=0, columnspan=2, pady=3, sticky="w")
+        ).grid(row=1, column=0, columnspan=2, pady=3, sticky="w")
 
         ttk.Label(wallpaper_frame, wraplength=640, text=(
-            "Position controls how Windows places the finished image. With an image "
-            "already matching the screen size, several positions look identical. "
-            "Image > Fit mode controls its content before Windows places it."
-        )).grid(row=3, column=0, columnspan=2, pady=(4, 0), sticky="w")
+            "Choose each display under Output device and set its position under Output. "
+            "Do not update keeps its current wallpaper. Restore previous wallpaper "
+            "uses a saved copy when one is available."
+        )).grid(row=2, column=0, columnspan=2, pady=(4, 0), sticky="w")
 
         display_time_frame = ttk.LabelFrame(general_tab, text="Date and time", padding=8)
         display_time_frame.grid(row=2, column=0, pady=(0, 8), sticky="ew")
@@ -7077,8 +7825,68 @@ def run_with_windows_tray(argv=None):
             "Provider and cache timestamps remain stored in UTC."
         )).grid(row=1, column=0, columnspan=2, pady=(4, 0), sticky="w")
 
+        output_device_frame = ttk.LabelFrame(general_tab, text="Output device", padding=8)
+        output_device_frame.grid(row=4, column=0, pady=(0, 8), sticky="ew")
+        output_device_combo = add_combo(
+            output_device_frame, 0, "Screen / monitor", variables["output_device"],
+            tuple(output_device_ids), width=38,
+        )
+        output_device_combo.bind("<<ComboboxSelected>>", select_output_device)
+
+        def refresh_output_device_choices():
+            try:
+                attached = list_windows_wallpaper_monitors()
+            except Exception as exc:
+                log(f"Unable to refresh output devices: {exc}")
+                return
+            choices = {"All monitors": None}
+            for index, monitor in enumerate(attached, start=1):
+                left, top, right, bottom = monitor["rect"]
+                choices[f"Display {index} ({right - left} x {bottom - top})"] = monitor["id"]
+            if choices == output_device_ids:
+                return
+            selected_id = active_output_device["id"]
+            output_device_ids.clear()
+            output_device_ids.update(choices)
+            output_device_combo.configure(values=tuple(choices))
+            selected_label = next(
+                (label for label, monitor_id in choices.items() if monitor_id == selected_id),
+                "All monitors",
+            )
+            if selected_label != variables["output_device"].get():
+                variables["output_device"].set(selected_label)
+                select_output_device()
+
+        output_device_combo.configure(postcommand=refresh_output_device_choices)
+        def restore_selected_wallpaper():
+            monitor_id = active_output_device["id"]
+            if monitor_id is None:
+                return
+            try:
+                restore_previous_wallpaper(monitor_id)
+            except FileNotFoundError as exc:
+                messagebox.showinfo("Restore previous wallpaper", str(exc), parent=root)
+                return
+            except Exception as exc:
+                messagebox.showerror("Unable to restore wallpaper", str(exc), parent=root)
+                return
+            monitor_positions_draft[monitor_id] = "none"
+            variables["position"].set("none")
+            request_runtime_configuration_reload(icon)
+
+        restore_wallpaper_button = ttk.Button(
+            output_device_frame, text="Restore previous wallpaper",
+            command=restore_selected_wallpaper,
+        )
+        restore_wallpaper_button.grid(row=2, column=1, pady=(5, 0), sticky="e")
+        restore_wallpaper_button.configure(state="disabled")
+        ttk.Label(output_device_frame, text=(
+            "All monitors sets the defaults. Select a display for its own Output "
+            "settings. A disconnected display keeps its settings for the next wallpaper update after reconnection."
+        ), wraplength=640).grid(row=1, column=0, columnspan=2, sticky="w")
+
         output_frame = ttk.LabelFrame(general_tab, text="Output", padding=8)
-        output_frame.grid(row=4, column=0, pady=(0, 8), sticky="ew")
+        output_frame.grid(row=5, column=0, pady=(0, 8), sticky="ew")
         resolution_combo = add_combo(
             output_frame,
             0,
@@ -7150,7 +7958,18 @@ def run_with_windows_tray(argv=None):
             "Largest available uses the most detailed source image; resizing uses "
             "high-quality Lanczos filtering. A WMS render factor adds no source detail."
         ))
-        noaa_quality_hint.grid(row=8, column=0, columnspan=2, pady=3, sticky="w")
+        position_combo = add_combo(
+            output_frame, 8, "Position", position_display,
+            tuple(WALLPAPER_POSITION_LABELS.values()), width=38,
+        )
+        position_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: variables["position"].set(next(
+                name for name, label in WALLPAPER_POSITION_LABELS.items()
+                if label == position_display.get()
+            )),
+        )
+        noaa_quality_hint.grid(row=9, column=0, columnspan=2, pady=3, sticky="w")
 
         copernicus_hidden_output_controls = [
             widget for widget in output_frame.winfo_children()
@@ -7223,7 +8042,7 @@ def run_with_windows_tray(argv=None):
         add_entry(generic_view_frame, 1, "Zoom", variables["zoom"])
         ttk.Label(generic_view_frame, wraplength=640, text=(
             "Fit keeps the whole view; Crop fills the output and trims the edges. "
-            "General > Wallpaper > Position then places the finished file on the desktop."
+            "General > Output > Position then places the finished file on the desktop."
         )).grid(row=2, column=0, columnspan=2, pady=(3, 0), sticky="w")
         preset_frame = source_settings.eumetsat_view_frame
         configure_source_columns(preset_frame)
@@ -7380,6 +8199,9 @@ def run_with_windows_tray(argv=None):
         def capture_image_form(validated_updates=None):
             provider, selections = source_settings.get_selection()
             values = {key: variable.get() for key, variable in variables.items()}
+            values.update(global_output_draft)
+            values["monitor_positions"] = dict(monitor_positions_draft)
+            values["monitor_output_settings"] = deepcopy(monitor_outputs_draft)
             values["view_preset"] = preset_label_to_value[values["view_preset"]]
             # Saving an Image snapshot does not depend on unfinished edits in
             # General or History. Apply validates those tabs separately.
@@ -7446,11 +8268,18 @@ def run_with_windows_tray(argv=None):
             variables["check_for_source_updates"].set(
                 snapshot["source"].get("check_for_updates", True)
             )
-            for key in ("width", "height", "aspect_ratio", "render_scale", "background_color", "latest_folder"):
-                value = output[key]
-                if key == "aspect_ratio" and not value:
-                    value = aspect_ratio_for_dimensions(output["width"], output["height"])
-                variables[key].set(value)
+            switching_output_device["active"] = True
+            try:
+                for key in (*MONITOR_OUTPUT_FIELDS, "latest_folder"):
+                    value = output[key]
+                    if key == "aspect_ratio" and not value:
+                        value = aspect_ratio_for_dimensions(output["width"], output["height"])
+                    variables[key].set(value)
+                    if key in global_output_draft:
+                        global_output_draft[key] = str(value)
+            finally:
+                switching_output_device["active"] = False
+            select_output_device()
             if provider == "eumetsat":
                 refresh_projection_choices()
             else:
@@ -8058,6 +8887,11 @@ def run_with_windows_tray(argv=None):
                 key: variable.get()
                 for key, variable in variables.items()
             }
+            raw_values.pop("output_device")
+            raw_values.update(global_output_draft)
+            raw_values["position"] = global_position_draft["value"]
+            raw_values["monitor_positions"] = dict(monitor_positions_draft)
+            raw_values["monitor_output_settings"] = deepcopy(monitor_outputs_draft)
             try:
                 requested_source, requested_profiles = source_settings.get_selection()
                 requested_copernicus_auth = source_settings.get_copernicus_auth()
@@ -8183,7 +9017,8 @@ def run_with_windows_tray(argv=None):
         for page in notebook.tabs():
             bind_page_scrolling(root.nametowidget(page))
         for section in (
-            preset_frame, generic_view_frame, wallpaper_frame, display_time_frame, output_frame,
+            preset_frame, generic_view_frame, wallpaper_frame, display_time_frame,
+            output_device_frame, output_frame,
             update_frame, download_display_frame, download_retry_frame, catalogue_retry_frame,
             latest_folder_frame, history_frame, status_frame, cache_frame,
         ):
@@ -8777,6 +9612,7 @@ def run_with_windows_tray(argv=None):
         icon.visible = True
         worker.start()
         warm_public_catalogues()
+        check_for_startup_update()
 
     tray_icon.run(setup=tray_setup)
     APPLICATION_STOP_EVENT.set()
@@ -8790,6 +9626,10 @@ def run_with_windows_tray(argv=None):
 
 
 if __name__ == "__main__":
+    restart_wait = 15 if os.environ.get("MARBLESCAPE_RESTART_WAIT") == "1" else 0
+    if not acquire_windows_single_instance(wait_seconds=restart_wait):
+        log("MarbleScape is already running.")
+        sys.exit(0)
     if should_use_windows_tray():
         sys.exit(run_with_windows_tray())
     sys.exit(run_application())

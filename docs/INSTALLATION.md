@@ -10,7 +10,8 @@ A reviewed prebuilt package supports 64-bit Windows 10 and 11 and does not
 require a separate Python installation. Publish a newly built package only
 after completing the distribution review documented below.
 
-1. Download a published, reviewed `MarbleScape-windows-x64.zip` and
+1. Download a published, reviewed versioned archive such as
+   `MarbleScape-windows-x64_v1.3.0.zip` and
    `SHA256SUMS.txt` from
    [GitHub Releases](https://github.com/Gittegatt/MarbleScape/releases).
 2. Extract the complete ZIP archive into a user-writable folder. Do not run the
@@ -18,7 +19,7 @@ after completing the distribution review documented below.
 3. Optionally verify the download before starting it:
 
    ```powershell
-   Get-FileHash .\MarbleScape-windows-x64.zip -Algorithm SHA256
+   Get-FileHash .\MarbleScape-windows-x64_v1.3.0.zip -Algorithm SHA256
    Get-Content .\SHA256SUMS.txt
    ```
 
@@ -35,6 +36,10 @@ The tray icon appears immediately. The first wallpaper is applied after the
 selected source has been checked and its image download has completed. Use
 `Open image folder` to inspect the generated image, `Start with Windows` to
 enable per-user startup, and `Exit` to stop the application.
+On startup, MarbleScape checks the latest public GitHub release in the
+background. If a newer release exists, a small window offers **Skip this
+version** and **Open GitHub**. Skipping suppresses that release on later starts;
+the next newer release can still be shown.
 
 ## Run from source
 

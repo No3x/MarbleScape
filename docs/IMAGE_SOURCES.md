@@ -87,7 +87,9 @@ when a comparable clean product without SLIDER's optional overlays is required.
 | **Copernicus DEM** | Digital elevation model | Terrain and relief with broad coverage | Timeless terrain data rather than a current satellite image |
 | **Landsat 8/9** | Optical and thermal imagery | Land and water analysis and long historical time series | Longer revisit intervals than geostationary weather sources |
 
-For a general Copernicus image, start with **Sentinel-2 L2A · True color**.
+New installations start with **Sentinel-2 Mosaics · Sentinel-2 Quarterly Mosaics ·
+True Color Cloudless**. Select **Sentinel-2 L2A · True color** for a recent
+individual acquisition or finer local detail.
 Map zoom describes the requested geographic extent, not the optical zoom of a
 continuous global photograph. At a small map zoom, a Sentinel-2 overpass can
 occupy only a tiny part of the output. This is especially noticeable with
@@ -135,16 +137,28 @@ chooses the first listed storm area. Apply saves that active selection.
 
 **Refresh all catalogues**, to the left of Refresh catalogue, refreshes all
 NOAA, Himawari, CIRA SLIDER, NASA Worldview, and EUMETSAT metadata with progress and error reporting.
-It can take a while. MarbleScape refreshes these catalogues at application
-startup and refreshes the selected source catalogue when its Image source is
-selected. The last successful metadata is also stored in
+It can take a while. At application startup, MarbleScape reuses complete NOAA,
+Himawari, CIRA SLIDER, NASA Worldview, and EUMETSAT catalogues for up to 24
+hours after each source's last successful online check. Expired sources are
+checked separately. If a source is unavailable, its complete saved catalogue
+remains usable and another automatic online attempt is postponed for one hour.
+A manual refresh can retry immediately.
+**Refresh catalogue** and **Refresh all catalogues** always request an online
+check immediately.
+On source selection, saved catalogue entries appear immediately when
+available; use **Refresh catalogue** to request a new online check. The last
+successful metadata is also stored in
 `content/catalogues.json`. If a provider is unavailable or returns an
 incomplete catalogue, MarbleScape reports the problem and uses this disk cache
 when it contains the requested source. Successful remote results are compared
-with the local values first; identical catalogues do not rewrite the cache.
-NOAA area metadata expires after five
-minutes; product lists and Himawari metadata retain their provider-level memory
-caches between explicit refreshes.
+with the local values first; unchanged catalogue entries are kept while each
+source's check time is recorded.
+After a NOAA failure, cached GOES-East, GOES-West, and Solar selections remain
+editable. Automatic source resolution is the default for both GOES satellites.
+Within a running NOAA client, area metadata has a five-minute memory lifetime
+and product lists have a one-day memory lifetime. The persisted 24-hour startup
+window is separate from these in-memory limits. Himawari metadata retains its
+provider-level memory cache between explicit refreshes.
 When Copernicus OAuth credentials are configured, startup also refreshes and
 caches the acquisition dates for the saved Copernicus location and selection.
 Selecting Copernicus refreshes that location-specific date list again. Its
@@ -265,8 +279,9 @@ large WMS response times out or is rejected upstream, select a smaller Render
 resolution. A failed request keeps the previous wallpaper.
 
 **Refresh catalogue** reloads the NASA GIBS capabilities for this source.
-The startup and **Refresh all catalogues** jobs also warm this metadata without
-downloading imagery pixels. The capabilities catalogue is cached for one hour;
+The startup job checks this metadata when its persisted 24-hour cache has
+expired; **Refresh all catalogues** checks it immediately. Neither job downloads
+imagery pixels. The capabilities catalogue is also cached in memory for one hour;
 the newest time for the selected layer is checked independently during normal
 image checks. A small bundled true-color fallback keeps a saved
 selection visible during a catalogue outage, but a live GIBS connection is
@@ -281,8 +296,15 @@ bundled snapshot of the official Copernicus Browser catalogue. **Refresh
 Copernicus catalogue** queries the live STAC Catalog API for every acquisition
 date available at the current latitude/longitude and selection. **Latest
 available** is the default and is resolved again before each image download.
-The initial Browser selection is Sentinel-2 with Sentinel-2 L2A and True color,
-matching the official Browser default.
+The initial Browser selection is Sentinel-2 Mosaics with Sentinel-2 Quarterly
+Mosaics and True Color Cloudless. Saved user selections remain unchanged.
+The **Mosaic brightness** slider applies only to Sentinel-1 and Sentinel-2
+mosaic layers. Its 100% setting uses the normal rendering; 25-200% in 5% steps
+adjusts the selected profile without changing other image sources. Sentinel-2
+cloudless mosaics use the Browser's optical contrast curve. Sentinel-1 IW RGB
+Ratio has a separate lower default gain. Sentinel-1 DH monthly mosaics mainly
+cover polar regions; if a selected region and month have no valid imagery,
+MarbleScape reports that rather than presenting the map background as imagery.
 For optical layers that support it, **Maximum cloud cover** filters satellite
 tiles by their published cloud-cover estimate. The slider runs from 0% to 100%
 in 5% steps and defaults to 30%, matching the Browser's initial Sentinel-2
@@ -321,7 +343,9 @@ The Process API renders the selected official evalscript. **Coverage mode**
 offers a single latest acquisition, black no-data areas, or a gap-filling
 composite. Gap filling uses the most recent valid pixel from the selected 3,
 7, 14, 21, 30, 45, 60, 90, 120, 180, 270, 365, 550, 730, 920, or 1095-day
-lookback; 14 days is the default for new profiles. Any area
+lookback; 14 days is the default for new profiles.
+The month and year labels in the dropdown are approximate; the day count
+controls the actual range. Any area
 still without imagery uses the map background. Outputs above the
 Process API's 2500 × 2500 pixel request limit are split into tiles and joined
 without reducing the configured wallpaper resolution. In gap-fill mode, a large
@@ -330,8 +354,9 @@ Only tiles containing missing pixels are requested again; existing image pixels
 are kept. This can recover coverage that the Process API omits from a broad
 request, but it adds API requests and cannot create imagery where none exists.
 
-**Map labels** adds the GISCO/OpenStreetMap place, road, POI, and boundary overlay. The black coverage
-mode keeps transparent no-data pixels black. Attribution is written into
+**Map labels** adds the GISCO/OpenStreetMap place, road, POI, and boundary
+overlay. The black coverage mode keeps transparent no-data pixels black.
+Attribution is written into
 generated images whenever map tiles are used.
 The cloud limit is applied to both acquisition-date discovery and image
 rendering. With **Single latest acquisition** or black no-data mode, MarbleScape

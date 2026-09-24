@@ -270,7 +270,7 @@ class SourceRuntimeTests(unittest.TestCase):
         provider, first = app.normalize_source_configuration("eumetsat", {})
         _, second = app.normalize_source_configuration("eumetsat", {})
         self.assertEqual(provider, "eumetsat")
-        for source in ("goes_east", "goes_west", "solar", "himawari", "slider"):
+        for source in app.AUTO_RESOLUTION_PROVIDERS:
             self.assertEqual(app.DEFAULT_SOURCE_PROFILES[source]["resolution"], "auto")
             self.assertEqual(second[source]["resolution"], "auto")
         first["goes_east"]["product"] = "13"
@@ -290,6 +290,34 @@ class SourceRuntimeTests(unittest.TestCase):
         _, normalized = app.normalize_source_configuration("solar", source)
         source["solar"]["product"] = "Fe304"
         self.assertEqual(normalized["solar"]["product"], "Fe094")
+
+    def test_first_start_uses_auto_and_later_preserves_user_resolution(self):
+        template = app.DEFAULT_CONFIG_TEMPLATE_PATH.read_text(encoding="utf-8")
+        packaged_defaults = tomllib.loads(template)
+        for provider in app.AUTO_RESOLUTION_PROVIDERS:
+            self.assertEqual(packaged_defaults["sources"][provider]["resolution"], "auto")
+        for provider in app.AUTO_RESOLUTION_PROVIDERS:
+            template = app.replace_toml_section_value(
+                template, f"sources.{provider}", "resolution", "largest"
+            )
+        template_path = self.root / "old-defaults.toml"
+        config_path = self.root / "fresh-settings.toml"
+        template_path.write_text(template, encoding="utf-8")
+        with patch.object(app, "DEFAULT_CONFIG_PATH", config_path), \
+             patch.object(app, "DEFAULT_CONFIG_TEMPLATE_PATH", template_path):
+            app.load_configuration(config_path)
+            created = tomllib.loads(config_path.read_text(encoding="utf-8"))
+            for provider in app.AUTO_RESOLUTION_PROVIDERS:
+                self.assertEqual(created["sources"][provider]["resolution"], "auto")
+                self.assertEqual(app.SOURCE_PROFILES[provider]["resolution"], "auto")
+            updated = app.replace_toml_section_value(
+                config_path.read_text(encoding="utf-8"),
+                "sources.goes_west", "resolution", "largest",
+            )
+            config_path.write_text(updated, encoding="utf-8")
+            app.load_configuration(config_path)
+            self.assertEqual(app.SOURCE_PROFILES["goes_west"]["resolution"], "largest")
+            self.assertEqual(app.SOURCE_PROFILES["goes_east"]["resolution"], "auto")
 
     def test_automatic_resolution_uses_smallest_source_that_avoids_upscaling(self):
         client = SimpleNamespace(list_products=Mock(return_value=[{
@@ -316,6 +344,49 @@ class SourceRuntimeTests(unittest.TestCase):
             ),
             "3600x2160",
         )
+
+    def test_automatic_resolution_covers_all_active_monitors(self):
+        client = SimpleNamespace(list_products=Mock(return_value=[{
+            "id": "GEOCOLOR",
+            "resolutions": ["1280x720", "2560x1440", "3072x2048"],
+        }]))
+        profile = {"area": "full_disk", "product": "GEOCOLOR", "resolution": "auto"}
+        monitors = [
+            {"id": "A", "rect": (0, 0, 2560, 1440)},
+            {"id": "B", "rect": (-1050, 0, 0, 1680)},
+        ]
+        with patch.object(app, "SET_WINDOWS_WALLPAPER", True), \
+             patch.object(app, "VIEW_MODE", "crop"), \
+             patch.object(app, "ZOOM", 1.0), \
+             patch.object(app, "WINDOWS_WALLPAPER_POSITION", "fit"), \
+             patch.object(app, "WINDOWS_WALLPAPER_MONITOR_POSITIONS", {}), \
+             patch.object(app, "WINDOWS_WALLPAPER_MONITOR_OUTPUTS", {}), \
+             patch.object(app, "list_windows_wallpaper_monitors", return_value=monitors):
+            self.assertEqual(app.automatic_source_output_size((1280, 720)),
+                             (2560, 1680))
+            self.assertEqual(app._resolved_profile_resolution(
+                client, "goes_east", profile, (1280, 720)), "3072x2048")
+            profile["resolution"] = "2560x1440"
+            self.assertEqual(app._resolved_profile_resolution(
+                client, "goes_east", profile, (1280, 720)), "2560x1440")
+            with patch.object(app, "WINDOWS_WALLPAPER_MONITOR_OUTPUTS", {
+                "B": {"width": 4000, "height": 0, "aspect_ratio": "16:9"},
+            }):
+                self.assertEqual(app.automatic_source_output_size((1280, 720)),
+                                 (4000, 2250))
+
+    def test_automatic_resolution_ignores_monitors_with_no_wallpaper(self):
+        monitors = [
+            {"id": "A", "rect": (0, 0, 2560, 1440)},
+            {"id": "B", "rect": (2560, 0, 3840, 720)},
+        ]
+        with patch.object(app, "SET_WINDOWS_WALLPAPER", True), \
+             patch.object(app, "WINDOWS_WALLPAPER_POSITION", "fit"), \
+             patch.object(app, "WINDOWS_WALLPAPER_MONITOR_POSITIONS", {"A": "none"}), \
+             patch.object(app, "WINDOWS_WALLPAPER_MONITOR_OUTPUTS", {}), \
+             patch.object(app, "list_windows_wallpaper_monitors", return_value=monitors):
+            self.assertEqual(app.automatic_source_output_size((800, 600)),
+                             (1280, 720))
 
     def test_disabled_updates_reuse_matching_latest_without_provider_contact(self):
         app.IMAGE_SOURCE = "eumetsat"

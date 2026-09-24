@@ -6,6 +6,14 @@ param(
 $ErrorActionPreference = "Stop"
 
 $projectRoot = [System.IO.Path]::GetFullPath($PSScriptRoot)
+$versionOutput = & $PythonCommand -c 'import sys; sys.path.insert(0, sys.argv[1]); from app_version import VERSION; print(VERSION)' $projectRoot
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to read the MarbleScape application version."
+}
+$appVersion = ($versionOutput | Select-Object -Last 1).Trim()
+if ($appVersion -notmatch '^\d+\.\d+\.\d+$') {
+    throw "Invalid MarbleScape application version: $appVersion"
+}
 $releaseRoot = [System.IO.Path]::GetFullPath(
     (Join-Path $projectRoot "release")
 )
@@ -16,7 +24,7 @@ $windowsPackageDirectory = [System.IO.Path]::GetFullPath(
     (Join-Path $releaseRoot "MarbleScape-windows-x64")
 )
 $sourceArchive = Join-Path $releaseRoot "MarbleScape-source.zip"
-$windowsArchive = Join-Path $releaseRoot "MarbleScape-windows-x64.zip"
+$windowsArchive = Join-Path $releaseRoot ("MarbleScape-windows-x64_v" + $appVersion + ".zip")
 $checksumsPath = Join-Path $releaseRoot "SHA256SUMS.txt"
 $rootExecutable = Join-Path $projectRoot "marblescape.exe"
 $thirdPartyLicenceNames = @(
@@ -111,6 +119,39 @@ function Copy-PublicFile {
     )
 }
 
+function Write-ReleaseArchive {
+    param(
+        [string]$SourceDirectory,
+        [string]$ArchivePath
+    )
+
+    $archiveCode = @'
+from pathlib import Path
+import sys
+import zipfile
+
+source = Path(sys.argv[1])
+archive_path = Path(sys.argv[2])
+with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED,
+                     compresslevel=9, allowZip64=True) as archive:
+    for item in sorted(source.rglob("*")):
+        if item.is_symlink():
+            raise RuntimeError(f"Release file must not be a link: {item}")
+        if item.is_file():
+            archive.write(item, item.relative_to(source.parent).as_posix())
+'@
+    $archiveHelperPath = Join-Path $tempBuildRoot "archive_release.py"
+    [System.IO.File]::WriteAllText(
+        $archiveHelperPath,
+        $archiveCode,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    & $PythonCommand $archiveHelperPath $SourceDirectory $ArchivePath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not create release archive: $ArchivePath"
+    }
+}
+
 # Validate the source bundle before replacing any existing release files.
 & $PythonCommand (Join-Path $projectRoot "verify_pystray_source.py")
 if ($LASTEXITCODE -ne 0) {
@@ -158,6 +199,19 @@ try {
             "Build dependencies are missing. Install them with " +
             "'python -m pip install -r requirements-build.txt'."
         )
+    }
+
+    & $PythonCommand -c (
+        'import sys,tomllib;from pathlib import Path;' +
+        'sys.path.insert(0,sys.argv[1]);' +
+        'from marblescape_source_defaults import AUTO_RESOLUTION_PROVIDERS,DEFAULT_SOURCE_PROFILES;' +
+        'settings=tomllib.loads((Path(sys.argv[1])/"marblescape_config.example.toml").read_text(encoding="utf-8"));' +
+        'wrong=[name for name in AUTO_RESOLUTION_PROVIDERS if settings.get("sources",{}).get(name,{}).get("resolution")!="auto" or DEFAULT_SOURCE_PROFILES[name]["resolution"]!="auto"];' +
+        'print("Non-automatic source defaults: "+", ".join(wrong) if wrong else "All source resolution defaults are automatic.");' +
+        'sys.exit(bool(wrong))'
+    ) $projectRoot
+    if ($LASTEXITCODE -ne 0) {
+        throw "The release configuration must default every source resolution to auto."
     }
 
     $pythonArchitecture = & $PythonCommand -c 'import platform,struct;print(platform.machine()+chr(58)+str(struct.calcsize(bytes((80,)))*8))'
@@ -272,19 +326,7 @@ try {
     }
 
     # Publish the same smoke-tested binary in the project root on every build.
-    $rootExecutableTemp = Join-Path $projectRoot (
-        ".marblescape-" + [guid]::NewGuid().ToString("N") + ".tmp"
-    )
-    Assert-ChildPath -Parent $projectRoot -Candidate $rootExecutableTemp
-    try {
-        Copy-Item -LiteralPath $builtExecutable -Destination $rootExecutableTemp
-        Move-Item -LiteralPath $rootExecutableTemp -Destination $rootExecutable -Force
-    }
-    finally {
-        if (Test-Path -LiteralPath $rootExecutableTemp) {
-            Remove-Item -LiteralPath $rootExecutableTemp -Force
-        }
-    }
+    Copy-Item -LiteralPath $builtExecutable -Destination $rootExecutable -Force
 
     foreach ($file in @(
         ".gitignore",
@@ -306,9 +348,11 @@ try {
         "marblescape_catalogues.py",
         "marblescape_catalogue_activity.py",
         "marblescape_copernicus.py",
+        "marblescape_copernicus_mosaics.py",
         "marblescape_copernicus_settings.py",
         "marblescape_copernicus_catalog.json",
         "marblescape_source_layout.py",
+        "marblescape_source_defaults.py",
         "marblescape_source_settings.py",
         "marblescape_cache.py",
         "marblescape_profiles.py",
@@ -414,12 +458,12 @@ try {
             Copy-PublicFile -SourceName $sourceName -DestinationDirectory $thirdPartyDirectory
         }
     }
-    Compress-Archive -LiteralPath $sourcePackageDirectory -DestinationPath $sourceArchive -CompressionLevel Optimal
+    Write-ReleaseArchive -SourceDirectory $sourcePackageDirectory -ArchivePath $sourceArchive
     # Keep the exact application source and build instructions with the binary.
     $correspondingSourceDirectory = Join-Path $windowsPackageDirectory "source"
     New-Item -ItemType Directory -Path $correspondingSourceDirectory | Out-Null
     Copy-Item -LiteralPath $sourceArchive -Destination $correspondingSourceDirectory
-    Compress-Archive -LiteralPath $windowsPackageDirectory -DestinationPath $windowsArchive -CompressionLevel Optimal
+    Write-ReleaseArchive -SourceDirectory $windowsPackageDirectory -ArchivePath $windowsArchive
 
     $checksumLines = foreach ($archive in @(
         $sourceArchive,
@@ -439,6 +483,14 @@ try {
 
     Remove-Item -LiteralPath $sourcePackageDirectory -Recurse -Force
     Remove-Item -LiteralPath $windowsPackageDirectory -Recurse -Force
+
+    foreach ($oldArchive in @(Get-ChildItem -LiteralPath $releaseRoot -File -Filter "MarbleScape-windows-x64*.zip")) {
+        if ($oldArchive.FullName -ne $windowsArchive) {
+            Assert-ChildPath -Parent $releaseRoot -Candidate $oldArchive.FullName
+            Assert-NotReparsePoint -Path $oldArchive.FullName
+            Remove-Item -LiteralPath $oldArchive.FullName -Force
+        }
+    }
 
     Write-Host "Release archives created:"
     Write-Host "  $sourceArchive"

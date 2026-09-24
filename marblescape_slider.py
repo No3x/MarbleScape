@@ -265,19 +265,30 @@ class SliderClient:
         if track:
             DOWNLOAD_PROGRESS.raise_if_cancelled()
         _checked_url(url)
-        request = urllib.request.Request(url, headers={
+        cache = getattr(self, "metadata_cache", None) if not track else None
+        request_headers = {
             "User-Agent": self.user_agent, "Cache-Control": "no-cache",
-        })
+        }
+        if cache:
+            request_headers.update(cache.headers(url))
+        request = urllib.request.Request(url, headers=request_headers)
         try:
             opener = self._opener or urllib.request.build_opener(_Redirects())
             timeout = self.timeout if track else min(self.timeout, 20.0)
             with opener.open(request, timeout=timeout) as response:
                 _checked_url(response.geturl())
                 try:
-                    return read_response(response, limit, track=track), dict(response.headers.items())
+                    body = read_response(response, limit, track=track)
+                    response_headers = dict(response.headers.items())
+                    if cache:
+                        cache.store(url, body, response_headers)
+                    return body, response_headers
                 except ResponseTooLargeError:
                     raise SliderError("CIRA SLIDER response exceeds the permitted download size.")
         except urllib.error.HTTPError as exc:
+            if exc.code == 304 and cache and (saved := cache.response(url, limit)) is not None:
+                exc.close()
+                return saved
             raise UnavailableError(
                 "CIRA SLIDER request failed (HTTP %s): %s" % (exc.code, url)
             ) from exc

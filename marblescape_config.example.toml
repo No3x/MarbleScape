@@ -56,20 +56,22 @@ resolution = "auto"
 # acquisition available at the selected latitude/longitude.
 [sources.copernicus]
 configuration = "DEFAULT-THEME"
-mission = "Sentinel-2"
-product = "DEFAULT-THEME::a91f72"
-layer = "1_TRUE_COLOR"
+mission = "Sentinel-2 Mosaics"
+product = "MARBLESCAPE::S2-QUARTERLY"
+layer = "TRUE_COLOR_CLOUDLESS"
 highlight = ""
 date = "latest"
 latitude = 51.1657
 longitude = 10.4515
 map_zoom = 7
 map_labels = true
-coverage_mode = "fill_gaps"
+coverage_mode = "single"
 # Supported maximum lookback values: 3, 7, 14, 21, 30, 45, 60, 90, 120, 180, 270, 365, 550, 730, 920, or 1095 days.
 lookback_days = 14
 # Optical layers: maximum tile cloud cover, 0-100 in 5% steps. Unsupported layers ignore it.
 max_cloud_cover = 30
+# Copernicus mosaic brightness: 25-200 in 5% steps; 100 uses the calibrated default.
+brightness = 100
 
 # Create a free OAuth client under User Settings > OAuth clients at:
 # https://shapps.dataspace.copernicus.eu/dashboard/#/account/settings
@@ -141,11 +143,16 @@ minutes = 0
 
 [windows]
 set_wallpaper = true
-position = "fit"                # center, tile, stretch, fit, fill, or span
+position = "fit"                # center, tile, stretch, fit, fill, span, or none
+monitor_positions = "{}"       # Per-monitor overrides are saved by the settings dialog.
+monitor_output_settings = "{}" # Per-monitor size, quality and color overrides.
 pause_on_error = true
 
 [display]
 time_zone = "system"            # system (recommended) or utc; display only
+
+[updates]
+skipped_version = ""            # Latest release dismissed from the startup notice.
 
 [profile_list]
 visible_columns = ["name", "source", "selection", "time", "location", "latitude", "longitude", "coverage"]

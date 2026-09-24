@@ -37,6 +37,7 @@ class WallpaperCOMTests(unittest.TestCase):
         self.stack.enter_context(patch.object(app.ctypes, "windll", SimpleNamespace(ole32=self.ole32)))
         self.stack.enter_context(patch.object(app, "create_desktop_wallpaper_interface", side_effect=self.create_interface))
         self.stack.enter_context(patch.object(app, "get_com_method", side_effect=self.get_method))
+        self.stack.enter_context(patch.object(app, "list_windows_wallpaper_monitors", return_value=[]))
         self.stack.enter_context(patch.object(app, "log"))
         self.stack.enter_context(patch.object(app, "WINDOWS_WALLPAPER_POSITION", "fit"))
 

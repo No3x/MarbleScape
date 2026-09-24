@@ -3,12 +3,14 @@
 The bundled catalogue is derived from the official MIT-licensed Copernicus
 Browser metadata cache.  Image rendering uses the documented Copernicus Data
 Space Sentinel Hub Process API.  OAuth client credentials belong to the user;
-no Browser application credentials or undocumented endpoints are embedded.
+no Browser application credentials are embedded.  The account usage request
+uses the read-only endpoint called by the Copernicus Dashboard.
 """
 
 from __future__ import annotations
 
 import base64
+import binascii
 import ctypes
 import datetime as dt
 import io
@@ -35,12 +37,14 @@ from marblescape_download_progress import (
     ResponseTooLargeError,
     read_response,
 )
+from marblescape_copernicus_mosaics import MOSAIC_PRODUCTS, evalscript_for_brightness
 
 
 TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 PROCESS_URL = "https://sh.dataspace.copernicus.eu/process/v1"
 CATALOG_URL = "https://sh.dataspace.copernicus.eu/catalog/v1/search"
 ACCOUNT_SETTINGS_URL = "https://shapps.dataspace.copernicus.eu/dashboard/#/account/settings"
+ACCOUNT_USAGE_URL = "https://sh.dataspace.copernicus.eu/api/v1/accounting/usage"
 OSM_BACKGROUND_URL = (
     "https://gisco-services.ec.europa.eu/maps/tiles/"
     "OSMCartoBackground/EPSG3857/{z}/{x}/{y}.png"
@@ -65,7 +69,7 @@ TILE_SIZE = 256
 TILE_CACHE_LIMIT = 256
 GISCO_MAX_NATIVE_ZOOM = 18
 NETWORK_ATTEMPTS = 3
-SUPPORTED_MAP_ZOOMS = tuple(range(3, 26))
+SUPPORTED_MAP_ZOOMS = tuple(range(2, 26))
 COVERAGE_MODES = ("single", "black", "fill_gaps")
 LOOKBACK_DAYS = (3, 7, 14, 21, 30, 45, 60, 90, 120, 180, 270, 365, 550, 730, 920, 1095)
 DATA_TYPE_ZOOM_RANGES = {
@@ -86,18 +90,19 @@ CLIENT_ID_ENVIRONMENT_VARIABLE = "MARBLESCAPE_COPERNICUS_CLIENT_ID"
 
 DEFAULT_PROFILE = {
     "configuration": "DEFAULT-THEME",
-    "mission": "Sentinel-2",
-    "product": "DEFAULT-THEME::a91f72",
-    "layer": "1_TRUE_COLOR",
+    "mission": "Sentinel-2 Mosaics",
+    "product": "MARBLESCAPE::S2-QUARTERLY",
+    "layer": "TRUE_COLOR_CLOUDLESS",
     "highlight": "",
     "date": "latest",
     "latitude": 51.1657,
     "longitude": 10.4515,
     "map_zoom": 7,
     "map_labels": True,
-    "coverage_mode": "fill_gaps",
+    "coverage_mode": "single",
     "lookback_days": 14,
     "max_cloud_cover": 30,
+    "brightness": 100,
 }
 
 _CATALOGUE = None
@@ -134,6 +139,10 @@ def load_catalogue():
                 value = json.load(handle)
             if value.get("schema_version") != 1 or not isinstance(value.get("themes"), list):
                 raise ValueError("The bundled Copernicus catalogue has an unsupported format.")
+            default_theme = next((item for item in value["themes"]
+                                  if item.get("id") == "DEFAULT-THEME"), None)
+            if default_theme is not None:
+                default_theme["products"].extend(MOSAIC_PRODUCTS)
             _CATALOGUE = value
         return _CATALOGUE
 
@@ -160,7 +169,8 @@ def missions(theme_id=None):
             for mission in product["missions"]:
                 if mission not in result:
                     result.append(mission)
-    preferred = ["Sentinel-1", "Sentinel-2", "Sentinel-3", "Sentinel-5P",
+    preferred = ["Sentinel-1", "Sentinel-1 Mosaics", "Sentinel-2", "Sentinel-2 Mosaics",
+                 "Sentinel-3", "Sentinel-5P",
                  "Copernicus DEM", "Landsat 8/9"]
     return sorted(result, key=lambda value: (
         preferred.index(value) if value in preferred else len(preferred), value.casefold()
@@ -189,6 +199,8 @@ def map_zooms(layer):
     """Return the zoom choices published by Copernicus Browser for a layer."""
     if not isinstance(layer, dict):
         return SUPPORTED_MAP_ZOOMS
+    if "minimum_zoom" in layer:
+        return tuple(range(layer["minimum_zoom"], layer["maximum_zoom"] + 1))
     low, high = DATA_TYPE_ZOOM_RANGES.get(layer.get("data_type"),
                                            (SUPPORTED_MAP_ZOOMS[0], SUPPORTED_MAP_ZOOMS[-1]))
     return tuple(range(low, high + 1))
@@ -207,7 +219,10 @@ def map_zooms_for_view(layer, latitude, output_size):
     result = []
     for zoom in map_zooms(layer):
         _cx, cy, world_size = _world_pixel_center(latitude, 0.0, zoom)
-        if width <= world_size and cy - height / 2 >= 0 and cy + height / 2 <= world_size:
+        if layer and "low_resolution_data_type" in layer:
+            if 0 < cy < world_size:
+                result.append(zoom)
+        elif width <= world_size and cy - height / 2 >= 0 and cy + height / 2 <= world_size:
             result.append(zoom)
     return tuple(result)
 
@@ -283,6 +298,8 @@ def normalize_profile(profile):
             raise ValueError(f"Copernicus {key} must be true or false.")
     if result["coverage_mode"] not in COVERAGE_MODES:
         raise ValueError("Copernicus coverage mode is invalid.")
+    if "date_granularity" in layer:
+        result["coverage_mode"] = "single"
     if type(result["lookback_days"]) is not int or result["lookback_days"] not in LOOKBACK_DAYS:
         raise ValueError(
             "Copernicus maximum lookback must be one of: "
@@ -292,6 +309,9 @@ def normalize_profile(profile):
             or not 0 <= result["max_cloud_cover"] <= 100
             or result["max_cloud_cover"] % 5):
         raise ValueError("Copernicus maximum cloud cover must be 0-100% in 5% steps.")
+    if (type(result["brightness"]) is not int or not 25 <= result["brightness"] <= 200
+            or result["brightness"] % 5):
+        raise ValueError("Copernicus mosaic brightness must be 25-200% in 5% steps.")
     return result
 
 
@@ -419,12 +439,25 @@ def _world_pixel_center(latitude, longitude, zoom):
     return x, y, world_size
 
 
-def geographic_bbox(profile, width, height):
-    """Return the WGS84 bbox of the requested slippy-map view."""
-    profile = normalize_profile(profile)
+def _scaled_view_center(profile, width, height):
     cx, cy, world_size = _world_pixel_center(
         profile["latitude"], profile["longitude"], profile["map_zoom"]
     )
+    product = get_product(profile["configuration"], profile["product"])
+    layer = get_layer(product, profile["layer"])
+    if not layer or "low_resolution_data_type" not in layer:
+        return cx, cy, world_size
+    vertical_room = 2 * min(cy, world_size - cy)
+    if vertical_room <= 0:
+        raise ValueError("The Copernicus view crosses a Web Mercator pole; move the latitude.")
+    scale = max(1.0, width / world_size, height / vertical_room)
+    return cx * scale, cy * scale, world_size * scale
+
+
+def geographic_bbox(profile, width, height):
+    """Return the WGS84 bbox of the requested slippy-map view."""
+    profile = normalize_profile(profile)
+    cx, cy, world_size = _scaled_view_center(profile, width, height)
     top, bottom = cy - height / 2, cy + height / 2
     if top < 0 or bottom > world_size:
         raise ValueError("The Copernicus view crosses a Web Mercator pole; increase map zoom or move the latitude.")
@@ -450,6 +483,14 @@ def geographic_bbox(profile, width, height):
 def supports_cloud_filter(layer):
     """Only collections advertising this Process filter expose cloud control."""
     return "maxCloudCoverage" in layer.get("data_filter", {})
+
+
+def _collection_for_resolution(layer, meters_per_pixel):
+    alternate = layer.get("low_resolution_data_type")
+    threshold = layer.get("low_resolution_threshold_m", 320)
+    if alternate and meters_per_pixel > threshold:
+        return alternate
+    return layer["data_type"]
 
 
 def _catalog_filter(layer, max_cloud_cover=None):
@@ -705,6 +746,42 @@ class CopernicusClient:
             self._token_deadline = time.monotonic() + max(30.0, expires - 60.0)
             return token
 
+    def account_usage(self):
+        """Read the current account's monthly limits and consumption."""
+        token = self.access_token()
+        request = urllib.request.Request(
+            ACCOUNT_USAGE_URL,
+            headers={"Authorization": "Bearer " + token,
+                     "Accept": "application/json", "User-Agent": self.user_agent},
+        )
+        raw, _ = self._open(request, MAX_CATALOGUE_RESPONSE_BYTES)
+        try:
+            value = json.loads(raw.decode("utf-8"))
+            claims = json.loads(base64.urlsafe_b64decode(token.split(".")[1] + "=="))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, IndexError,
+                binascii.Error) as exc:
+            raise RuntimeError("Copernicus returned invalid account usage data.") from exc
+        if not isinstance(value, dict) or not isinstance(claims, dict):
+            raise RuntimeError("Copernicus returned invalid account usage data.")
+        realm_access = claims.get("realm_access")
+        roles = realm_access.get("roles", []) if isinstance(realm_access, dict) else []
+        if not isinstance(roles, list):
+            roles = []
+        role = next((item for item in roles if isinstance(item, str)
+                     and item.endswith("-quota")), "Unavailable")
+        result = {"role": role}
+        for key in ("processingUnitsMonthly", "requestsMonthly"):
+            entry = value.get(key)
+            if not isinstance(entry, dict):
+                raise RuntimeError("Copernicus returned incomplete account usage data.")
+            result[key] = {}
+            for field in ("configuration", "consumed", "remaining"):
+                item = entry.get(field)
+                if not isinstance(item, (str, int, float)) or isinstance(item, bool):
+                    raise RuntimeError("Copernicus returned incomplete account usage data.")
+                result[key][field] = str(item)
+        return result
+
     def _json_request(self, url, payload):
         request = urllib.request.Request(
             url, data=json.dumps(payload, separators=(",", ":")).encode("utf-8"), method="POST",
@@ -732,12 +809,14 @@ class CopernicusClient:
         # discovery itself uses the requested centre point, matching the custom
         # latitude/longitude selection even for views crossing the date line.
         geographic_bbox(profile, width, height)
+        _cx, _cy, world_size = _scaled_view_center(profile, width, height)
+        meters_per_pixel = 2 * WEB_MERCATOR_HALF_WORLD / world_size
         payload = {
             "intersects": {"type": "Point", "coordinates": [
                 profile["longitude"], profile["latitude"]
             ]},
             "datetime": f"{start}/{end}",
-            "collections": [layer["data_type"]],
+            "collections": [_collection_for_resolution(layer, meters_per_pixel)],
             "limit": int(limit),
         }
         query_filter = _catalog_filter(layer, profile["max_cloud_cover"])
@@ -772,9 +851,16 @@ class CopernicusClient:
                     f" with at most {profile['max_cloud_cover']}% cloud cover per satellite tile"
                     if supports_cloud_filter(layer) else ""
                 )
+                advice = (
+                    " Try a higher cloud limit or another location."
+                    if supports_cloud_filter(layer) else
+                    " DH monthly mosaics cover mainly polar regions; use IW for non-polar land."
+                    if product["id"] == "MARBLESCAPE::S1-DH-MONTHLY" else
+                    " Try another area or available date."
+                )
                 raise RuntimeError(
                     "No Copernicus acquisition is available for this location and product"
-                    + cloud_limit + ". Try a higher cloud limit or another location."
+                    + cloud_limit + "." + advice
                 )
             selected_date = acquisition.date().isoformat()
             # ``distinct: date`` deliberately returns day strings. Resolve the
@@ -804,13 +890,16 @@ class CopernicusClient:
             "latest": profile["date"] == "latest",
         }
 
-    def list_dates(self, profile, output_size, maximum=MAX_CATALOGUE_DATES):
+    def list_dates(self, profile, output_size, maximum=MAX_CATALOGUE_DATES, since=None):
         profile, product, layer = self._selection(profile)
         if layer["data_type"] == "dem":
             return []
         maximum = max(1, min(MAX_CATALOGUE_DATES, int(maximum)))
         width, height = map(int, output_size)
         start = dt.datetime.fromisoformat(layer["start_date"]).replace(tzinfo=dt.timezone.utc)
+        if since is not None:
+            recent = dt.datetime.fromisoformat(since).replace(tzinfo=dt.timezone.utc)
+            start = max(start, recent - dt.timedelta(days=14))
         end = dt.datetime.now(dt.timezone.utc)
         payload = self._catalog_payload(
             profile, product, layer, width, height, _utc_iso(start), _utc_iso(end), limit=100
@@ -835,9 +924,7 @@ class CopernicusClient:
     @staticmethod
     def _view_pixels(frame):
         profile, width, height = frame["profile"], frame["width"], frame["height"]
-        cx, cy, world_size = _world_pixel_center(
-            profile["latitude"], profile["longitude"], profile["map_zoom"]
-        )
+        cx, cy, world_size = _scaled_view_center(profile, width, height)
         left, top = cx - width / 2, cy - height / 2
         if top < 0 or top + height > world_size or width > world_size:
             geographic_bbox(profile, width, height)  # raises the precise validation message
@@ -901,7 +988,8 @@ class CopernicusClient:
         if layer["data_type"] != "dem":
             selected_date = frame["date"]
             start = dt.datetime.fromisoformat(selected_date).replace(tzinfo=dt.timezone.utc)
-            if frame["profile"]["coverage_mode"] == "fill_gaps":
+            if (frame["profile"]["coverage_mode"] == "fill_gaps"
+                    and "date_granularity" not in layer):
                 start -= dt.timedelta(days=frame["profile"]["lookback_days"] - 1)
                 data_filter["mosaickingOrder"] = "mostRecent"
             data_filter["timeRange"] = {
@@ -912,7 +1000,8 @@ class CopernicusClient:
                 ),
             }
             data_filter.setdefault("mosaickingOrder", "mostRecent")
-        data = {"type": layer["data_type"]}
+        meters_per_pixel = (bbox[2] - bbox[0]) / width
+        data = {"type": _collection_for_resolution(layer, meters_per_pixel)}
         if data_filter:
             data["dataFilter"] = data_filter
         if processing:
@@ -924,7 +1013,9 @@ class CopernicusClient:
             "output": {"width": width, "height": height, "responses": [{
                 "identifier": "default", "format": {"type": "image/png"}
             }]},
-            "evalscript": layer["evalscript"],
+            "evalscript": evalscript_for_brightness(
+                layer, frame["profile"].get("brightness", 100)
+            ),
         }
         request = urllib.request.Request(
             PROCESS_URL, data=json.dumps(payload, separators=(",", ":")).encode("utf-8"), method="POST",
@@ -985,6 +1076,14 @@ class CopernicusClient:
                 size += self._refine_process_gaps(frame, image, x, y, view_pixels)
             canvas.alpha_composite(image, (x, y))
             downloaded += size
+        if (frame["layer"].get("date_granularity")
+                and canvas.getchannel("A").getextrema()[1] == 0):
+            if frame["product"]["id"] == "MARBLESCAPE::S1-DH-MONTHLY":
+                raise RuntimeError(
+                    "No Sentinel-1 DH mosaic imagery exists for this area and month. "
+                    "DH covers mainly polar regions; use Sentinel-1 IW for non-polar land."
+                )
+            raise RuntimeError("No mosaic imagery exists for this area and selected period.")
         return canvas, downloaded
 
     @staticmethod
@@ -1005,17 +1104,14 @@ class CopernicusClient:
     def _cached_map_tile(self, template, zoom, x, y):
         DOWNLOAD_PROGRESS.raise_if_cancelled()
         key = (template, zoom, x, y)
-        with self._tile_cache_lock:
-            cached = self._tile_cache.get(key)
-            if cached is not None:
-                return cached.copy(), 0
+        cached = self._load_cached_tile(key)
+        if cached is not None:
+            return cached, 0
         source_zoom = min(zoom, GISCO_MAX_NATIVE_ZOOM)
         factor = 2 ** (zoom - source_zoom)
         source_x, source_y = x // factor, y // factor
         source_key = (template, source_zoom, source_x, source_y)
-        with self._tile_cache_lock:
-            source_value = self._tile_cache.get(source_key)
-            source_value = source_value.copy() if source_value is not None else None
+        source_value = self._load_cached_tile(source_key)
         downloaded = 0
         if source_value is None:
             request = urllib.request.Request(
@@ -1037,10 +1133,24 @@ class CopernicusClient:
         self._store_tile(key, value)
         return value, downloaded
 
+    def _load_cached_tile(self, key):
+        with self._tile_cache_lock:
+            encoded = self._tile_cache.get(key)
+        if encoded is None:
+            return None
+        with Image.open(io.BytesIO(encoded)) as image:
+            return image.convert("RGBA")
+
     def _store_tile(self, key, value):
         with self._tile_cache_lock:
+            if key in self._tile_cache:
+                return
+        buffer = io.BytesIO()
+        value.save(buffer, format="PNG")
+        encoded = buffer.getvalue()
+        with self._tile_cache_lock:
             if key not in self._tile_cache:
-                self._tile_cache[key] = value.copy()
+                self._tile_cache[key] = encoded
                 self._tile_cache_order.append(key)
                 while len(self._tile_cache_order) > TILE_CACHE_LIMIT:
                     old = self._tile_cache_order.pop(0)
@@ -1049,17 +1159,14 @@ class CopernicusClient:
     def _cached_border_tile(self, template, zoom, x, y):
         DOWNLOAD_PROGRESS.raise_if_cancelled()
         key = (template, zoom, x, y)
-        with self._tile_cache_lock:
-            cached = self._tile_cache.get(key)
-            if cached is not None:
-                return cached.copy(), 0
+        cached = self._load_cached_tile(key)
+        if cached is not None:
+            return cached, 0
         source_zoom = min(zoom, GISCO_MAX_NATIVE_ZOOM)
         factor = 2 ** (zoom - source_zoom)
         source_x, source_y = x // factor, y // factor
         source_key = (template, source_zoom, source_x, source_y)
-        with self._tile_cache_lock:
-            source_value = self._tile_cache.get(source_key)
-            source_value = source_value.copy() if source_value is not None else None
+        source_value = self._load_cached_tile(source_key)
         downloaded = 0
         if source_value is None:
             request = urllib.request.Request(
@@ -1090,8 +1197,11 @@ class CopernicusClient:
         left, top, world_size = self._view_pixels(frame)
         zoom = frame["profile"]["map_zoom"]
         count = 2 ** zoom
-        first_x, last_x = math.floor(left / TILE_SIZE), math.floor((left + width - 1) / TILE_SIZE)
-        first_y, last_y = math.floor(top / TILE_SIZE), math.floor((top + height - 1) / TILE_SIZE)
+        display_tile_size = world_size / count
+        first_x, last_x = (math.floor(left / display_tile_size),
+                           math.floor((left + width - 1) / display_tile_size))
+        first_y, last_y = (math.floor(top / display_tile_size),
+                           math.floor((top + height - 1) / display_tile_size))
         coordinates = [(x, y) for y in range(first_y, last_y + 1)
                        for x in range(first_x, last_x + 1) if 0 <= y < count]
         fetched = {}
@@ -1108,9 +1218,14 @@ class CopernicusClient:
                 downloaded += size
         canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         for x, y in coordinates:
-            px = round(x * TILE_SIZE - left)
-            py = round(y * TILE_SIZE - top)
-            canvas.alpha_composite(fetched[(x, y)], (px, py))
+            px = round(x * display_tile_size - left)
+            py = round(y * display_tile_size - top)
+            tile_width = round((x + 1) * display_tile_size - left) - px
+            tile_height = round((y + 1) * display_tile_size - top) - py
+            tile = fetched[(x, y)]
+            if tile.size != (tile_width, tile_height):
+                tile = tile.resize((tile_width, tile_height), Image.Resampling.BILINEAR)
+            canvas.alpha_composite(tile, (px, py))
         return canvas, downloaded
 
     @staticmethod

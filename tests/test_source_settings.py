@@ -235,6 +235,16 @@ class SourceSettingsTests(unittest.TestCase):
         self.wait_for_catalogue(settings)
         self.assertEqual(settings.get_selection()[1]["goes_east"]["resolution"], "auto")
 
+    def test_every_new_resolution_source_starts_on_automatic(self):
+        settings = self.make_settings("goes_east", profiles={})
+        for provider in ("goes_east", "goes_west", "solar", "himawari", "slider", "worldview"):
+            with self.subTest(provider=provider):
+                if provider != "goes_east":
+                    self.select_provider(settings, provider)
+                self.wait_for_catalogue(settings)
+                self.assertEqual(settings._resolution_var.get(), "Automatic (recommended)")
+                self.assertEqual(settings.get_selection()[1][provider]["resolution"], "auto")
+
     def test_himawari_auto_default_and_catalogue_activity(self):
         settings = self.make_settings("himawari")
         self.assertTrue(settings._catalogue_activity.active)
@@ -303,6 +313,40 @@ class SourceSettingsTests(unittest.TestCase):
         result = settings.get_selection()[1]
         result["goes_east"]["product"] = "mutated"
         self.assertEqual(settings.get_selection()[1]["goes_east"]["product"], "13")
+
+    def test_cached_goes_catalogue_is_usable_during_offline_refresh(self):
+        class CachedClient(FakeNOAAClient):
+            def cached_areas(self, provider):
+                return deepcopy(self.areas[provider])
+
+            def cached_products(self, provider, _area_id):
+                return [{"id": "GEOCOLOR", "label": "GeoColor",
+                         "resolutions": ["678x678", "1808x1808"]}]
+
+            def catalogue_offline(self, _provider):
+                return True
+
+        client = CachedClient()
+        client.fail = True
+        client.catalogue_refresh_status["running"] = True
+        settings = self.make_settings("goes_east", client=client)
+        self.assertEqual(client.calls, [])
+        for combo in (settings._area_combo, settings._product_combo,
+                      settings._resolution_combo):
+            self.assertEqual(str(combo["state"]), "readonly")
+        self.assertEqual(settings._resolution_var.get(), "Automatic (recommended)")
+
+        self.select_provider(settings, "goes_west")
+        self.assertEqual(client.calls, [])
+        self.assertEqual(settings._resolution_var.get(), "Automatic (recommended)")
+        self.assertEqual(str(settings._area_combo["state"]), "readonly")
+        self.assertEqual(str(settings._product_combo["state"]), "readonly")
+
+        settings._refresh()
+        self.wait_for_catalogue(settings)
+        self.assertEqual(str(settings._area_combo["state"]), "readonly")
+        self.assertEqual(str(settings._product_combo["state"]), "readonly")
+        self.assertEqual(str(settings._resolution_combo["state"]), "readonly")
 
     def test_himawari_new_area_prefers_true_color_reproduction(self):
         settings = self.make_settings("himawari")
@@ -545,8 +589,14 @@ class SourceSettingsTests(unittest.TestCase):
         self.assertFalse(settings.eumetsat_frame.winfo_manager())
         self.assertFalse(settings._area_combo.winfo_manager())
         self.assertEqual(len(cop._configuration_combo["values"]), 13)
-        self.assertEqual(cop._mission_var.get(), "Sentinel-2")
+        self.assertEqual(cop._mission_var.get(), "Sentinel-2 Mosaics")
+        self.assertEqual(cop.get_profile()["product"], "MARBLESCAPE::S2-QUARTERLY")
+        self.assertEqual(cop.get_profile()["layer"], "TRUE_COLOR_CLOUDLESS")
+        cop._mission_var.set("Sentinel-2")
+        cop._select_mission()
         self.assertEqual(cop.get_profile()["product"], "DEFAULT-THEME::a91f72")
+        cop._coverage_var.set("Fill gaps with earlier imagery (use latest imagery of valid lookback)")
+        cop._select_coverage()
         self.assertEqual(cop._zoom_combo["values"], tuple(str(value) for value in range(7, 19)))
         self.assertEqual(cop.get_profile()["date"], "latest")
         self.assertEqual(cop.get_profile()["coverage_mode"], "fill_gaps")
@@ -555,11 +605,16 @@ class SourceSettingsTests(unittest.TestCase):
         self.assertEqual(str(cop._cloud_scale["state"]), "normal")
         cop._cloud_scale.set(15)
         self.assertEqual(cop.get_profile()["max_cloud_cover"], 15)
-        self.assertEqual(
-            cop._lookback_combo["values"],
-            tuple(f"{days} days" for days in
-                  (3, 7, 14, 21, 30, 45, 60, 90, 120, 180, 270, 365, 550, 730, 920, 1095)),
-        )
+        lookback_values = cop._lookback_combo["values"]
+        self.assertEqual(lookback_values[:4], ("3 days", "7 days", "14 days", "21 days"))
+        self.assertEqual(lookback_values[4], "30 days (1 month)")
+        self.assertEqual(lookback_values[7], "90 days (3 months)")
+        self.assertEqual(lookback_values[8], "120 days (4 months)")
+        self.assertEqual(lookback_values[-1], "1095 days (3 years)")
+        self.assertTrue(all("|" not in value for value in lookback_values))
+        cop._lookback_var.set(lookback_values[-1])
+        self.assertEqual(cop.get_profile()["lookback_days"], 1095)
+        cop._lookback_var.set(lookback_values[2])
         self.assertEqual(str(cop._lookback_combo["state"]), "readonly")
         cop._coverage_var.set("Single latest acquisition")
         cop._select_coverage()
@@ -584,6 +639,7 @@ class SourceSettingsTests(unittest.TestCase):
         cop._mission_var.set("Sentinel-1")
         cop._select_mission()
         self.assertEqual(str(cop._cloud_scale["state"]), "disabled")
+        self.assertEqual(str(cop._brightness_scale["state"]), "disabled")
         cop._mission_var.set("Sentinel-2")
         cop._select_mission()
         self.assertEqual(str(cop._cloud_scale["state"]), "normal")
@@ -624,11 +680,49 @@ class SourceSettingsTests(unittest.TestCase):
                 self.root.update()
                 time.sleep(0.01)
         self.assertEqual(copernicus._activity.completion.get(), "Completed.")
-        self.assertIn("2026-09-21", copernicus._date_combo["values"])
+        self.assertIn("2026 Q3", copernicus._date_combo["values"])
 
         missing = self.make_settings("copernicus")
         with self.assertRaises(ValueError):
             missing.get_selection()
+
+    def test_copernicus_mosaic_controls_and_account_credits(self):
+        settings = self.make_settings("copernicus")
+        cop = settings.copernicus_settings
+        cop._mission_var.set("Sentinel-2 Mosaics")
+        cop._select_mission()
+        self.assertEqual(cop._selected_product()["name"], "Sentinel-2 Quarterly Mosaics")
+        self.assertEqual(cop._date_label["text"], "Quarter")
+        self.assertEqual(str(cop._cloud_scale["state"]), "disabled")
+        self.assertEqual(str(cop._brightness_scale["state"]), "normal")
+        cop._brightness_var.set(75)
+        self.assertEqual(cop.get_profile()["brightness"], 75)
+        self.assertEqual(str(cop._coverage_combo["state"]), "disabled")
+        cop._update_date_choices(["2026-04-01"], "latest")
+        self.assertIn("2026 Q2", cop._date_combo["values"])
+
+        annual = next(label for label, product in cop._product_by_label.items()
+                      if product["name"] == "WorldCover Annual Cloudless Mosaics")
+        cop._product_var.set(annual)
+        cop._select_product()
+        self.assertEqual(cop._date_label["text"], "Year")
+        self.assertEqual(cop._zoom_combo["values"][0], "9")
+        cop._update_date_choices(["2021-01-01"], "latest")
+        self.assertIn("2021", cop._date_combo["values"])
+
+        usage = {"role": "copernicus-general-quota"}
+        for category in ("processingUnitsMonthly", "requestsMonthly"):
+            usage[category] = {"configuration": "30000", "consumed": "123",
+                               "remaining": "29877"}
+        cop._usage_results.put((cop._usage_generation, usage, ""))
+        cop.frame.after_cancel(cop._after_id)
+        cop._after_id = None
+        cop._poll()
+        self.assertEqual(cop._credits_role_var.get(), "Role: copernicus-general-quota")
+        self.assertEqual(cop._credits_values[("requestsMonthly", "remaining")].get(), "29877")
+        cop._client_id_var.set("different client")
+        self.assertEqual(cop._credits_role_var.get(), "Role: -")
+        self.assertEqual(cop._credits_values[("requestsMonthly", "remaining")].get(), "-")
 
     def test_copernicus_catalogue_retries_then_uses_cached_dates(self):
         client = FakeNOAAClient()
@@ -646,7 +740,7 @@ class SourceSettingsTests(unittest.TestCase):
                 self.root.update()
                 time.sleep(0.01)
         self.assertEqual(cop_client.return_value.list_dates.call_count, 3)
-        self.assertIn("2026-09-20", settings.copernicus_settings._date_combo["values"])
+        self.assertIn("2026 Q3", settings.copernicus_settings._date_combo["values"])
         self.assertIn("using cached catalogue data", settings.copernicus_settings._status_var.get())
 
     def test_active_storm_category_selects_and_commits_first_storm(self):

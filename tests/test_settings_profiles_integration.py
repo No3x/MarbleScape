@@ -76,6 +76,20 @@ class SettingsProfilesIntegrationTests(unittest.TestCase):
         self.assertEqual(context.errors, [])
         return tomllib.loads(context.config.read_text(encoding="utf-8"))
 
+    def test_manual_resolution_is_saved_without_changing_other_defaults(self):
+        def scenario(context):
+            context.source.set_selection("goes_east", app.DEFAULT_SOURCE_PROFILES)
+            self.wait_for_source(context)
+            self.assertEqual(context.source._resolution_var.get(),
+                             "Automatic (recommended)")
+            context.source._resolution_var.set("Largest available (1808x1808)")
+            context.source._select_resolution()
+            saved = self.apply(context)
+            self.assertEqual(saved["sources"]["goes_east"]["resolution"], "largest")
+            for provider in ("goes_west", "solar", "himawari", "slider", "worldview"):
+                self.assertEqual(saved["sources"][provider]["resolution"], "auto")
+        self.run_dialog(scenario)
+
     def run_dialog(self, scenario):
         import tkinter as tk
         from tkinter import ttk
@@ -609,6 +623,109 @@ class SettingsProfilesIntegrationTests(unittest.TestCase):
             context.root.update()
             self.assertEqual(canvas.yview(), before, "Mouse/combobox focus moved the Image viewport")
         self.run_dialog(scenario)
+
+    def test_output_device_position_is_saved_for_one_monitor(self):
+        from tkinter import ttk
+
+        monitors = [
+            {"id": r"\\?\DISPLAY#FIRST", "rect": (0, 0, 1920, 1080)},
+            {"id": r"\\?\DISPLAY#SECOND", "rect": (1920, 0, 3840, 1080)},
+        ]
+
+        def scenario(context):
+            general_id = next(tab for tab in context.notebook.tabs()
+                              if context.notebook.tab(tab, "text") == "General")
+            general = context.root.nametowidget(general_id)
+            device_combo = next(widget for widget in self.descendants(general)
+                                if isinstance(widget, ttk.Combobox)
+                                and str(widget.cget("textvariable")) ==
+                                str(context.variables["output_device"]))
+            context.variables["output_device"].set("Display 2 (1920 x 1080)")
+            device_combo.event_generate("<<ComboboxSelected>>")
+            context.variables["position"].set("none")
+            context.variables["output_device"].set("All monitors")
+            device_combo.event_generate("<<ComboboxSelected>>")
+            self.assertEqual(context.variables["position"].get(), "fit")
+            context.variables["output_device"].set("Display 2 (1920 x 1080)")
+            device_combo.event_generate("<<ComboboxSelected>>")
+            self.assertEqual(context.variables["position"].get(), "none")
+            saved = self.apply(context)
+            positions = json.loads(saved["windows"]["monitor_positions"])
+            self.assertEqual(positions, {monitors[1]["id"]: "none"})
+            self.assertEqual(saved["windows"]["position"], "fit")
+
+        with patch.object(app, "list_windows_wallpaper_monitors", return_value=monitors):
+            self.run_dialog(scenario)
+
+    def test_each_monitor_keeps_its_output_settings(self):
+        from tkinter import ttk
+
+        monitors = [
+            {"id": "DISPLAY-FIRST", "rect": (0, 0, 2560, 1440)},
+            {"id": "DISPLAY-SECOND", "rect": (2560, 0, 3610, 1680)},
+        ]
+
+        def scenario(context):
+            general_id = next(tab for tab in context.notebook.tabs()
+                              if context.notebook.tab(tab, "text") == "General")
+            general = context.root.nametowidget(general_id)
+            combo = next(widget for widget in self.descendants(general)
+                         if isinstance(widget, ttk.Combobox)
+                         and str(widget.cget("textvariable")) ==
+                         str(context.variables["output_device"]))
+            self.assertEqual(tuple(combo.cget("values")), (
+                "All monitors", "Display 1 (2560 x 1440)",
+                "Display 2 (1050 x 1680)",
+            ))
+            global_width = context.variables["width"].get()
+            context.variables["output_device"].set("Display 1 (2560 x 1440)")
+            combo.event_generate("<<ComboboxSelected>>")
+            context.variables["width"].set("1920")
+            context.variables["height"].set("0")
+            context.variables["aspect_ratio"].set("16:9")
+            context.variables["render_scale"].set("1.5")
+            context.variables["background_color"].set("#102030")
+            context.variables["position"].set("center")
+
+            context.variables["output_device"].set("Display 2 (1050 x 1680)")
+            combo.event_generate("<<ComboboxSelected>>")
+            context.variables["width"].set("1200")
+            context.variables["height"].set("0")
+            context.variables["aspect_ratio"].set("5:7")
+            context.variables["background_color"].set("#abcdef")
+            context.variables["position"].set("none")
+
+            context.variables["output_device"].set("All monitors")
+            combo.event_generate("<<ComboboxSelected>>")
+            self.assertEqual(context.variables["width"].get(), global_width)
+            context.variables["output_device"].set("Display 1 (2560 x 1440)")
+            combo.event_generate("<<ComboboxSelected>>")
+            self.assertEqual(context.variables["width"].get(), "1920")
+            self.assertEqual(context.variables["render_scale"].get(), "1.5")
+            self.assertEqual(context.variables["position"].get(), "center")
+            self.assertEqual(
+                context.profiles._capture_settings()["output"]["width"],
+                int(global_width),
+            )
+
+            saved = self.apply(context)
+            outputs = json.loads(saved["windows"]["monitor_output_settings"])
+            positions = json.loads(saved["windows"]["monitor_positions"])
+            self.assertEqual(outputs["DISPLAY-FIRST"], {
+                "width": 1920, "height": 0, "aspect_ratio": "16:9",
+                "render_scale": 1.5,
+                "background_color": "#102030",
+            })
+            self.assertEqual(outputs["DISPLAY-SECOND"], {
+                "width": 1200, "height": 0, "aspect_ratio": "5:7",
+                "background_color": "#ABCDEF",
+            })
+            self.assertEqual(positions, {
+                "DISPLAY-FIRST": "center", "DISPLAY-SECOND": "none",
+            })
+
+        with patch.object(app, "list_windows_wallpaper_monitors", return_value=monitors):
+            self.run_dialog(scenario)
 
 
 if __name__ == "__main__":

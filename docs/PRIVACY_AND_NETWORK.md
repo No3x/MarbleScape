@@ -11,6 +11,11 @@ API keys. It stores configuration and downloaded images locally. User-provided
 Copernicus OAuth credentials are used only for direct Copernicus Data Space API
 requests as described below.
 
+The Windows tray checks `api.github.com` for the latest public MarbleScape
+release once after each start. The About tab can repeat the check manually.
+Only release metadata is requested; no account login or OAuth credentials are
+sent. The skipped release version is stored in `marblescape_config.toml`.
+
 Network access depends on the selected source. EUMETSAT uses the WMS
 endpoint configured in `marblescape_config.toml`, which defaults to:
 
@@ -31,9 +36,10 @@ https://cdn.star.nesdis.noaa.gov
 ```
 
 The NOAA catalog supplies available areas, products, image sizes, and
-latest image links. The Windows application warms these catalogs in the
-background at startup, including when EUMETSAT is selected. This downloads
-metadata only. No NOAA account or API key is required.
+latest image links. The Windows application checks this metadata in the
+background at startup when its saved catalogue is older than 24 hours,
+including when EUMETSAT is selected. This downloads metadata only. No NOAA
+account or API key is required.
 
 Himawari uses the official NICT and JMA public image services:
 
@@ -43,7 +49,7 @@ https://jh190005-4.kudpc.kyoto-u.ac.jp/himawari
 https://ds.data.jma.go.jp/mscweb/data/himawari
 ```
 
-The shared startup catalogue job also warms Himawari metadata. No Himawari
+The shared startup catalogue job checks expired Himawari metadata. No Himawari
 account or API key is required. Image pixels are downloaded only when Himawari
 is selected or an active rotation profile uses it.
 
@@ -53,7 +59,7 @@ CIRA SLIDER uses its public catalogue, latest-time metadata, and PNG tile host:
 https://slider.cira.colostate.edu
 ```
 
-The shared startup catalogue job warms SLIDER's satellite, sector, product, and
+The shared startup catalogue job checks expired SLIDER satellite, sector, product, and
 source-size metadata. No CIRA account or API key is required. Product pixels are
 downloaded only when CIRA SLIDER is selected or an active rotation profile uses
 it. MarbleScape does not request SLIDER's separate map or latitude/longitude
@@ -67,9 +73,10 @@ https://gibs.earthdata.nasa.gov/wmts/epsg4326/best
 https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi
 ```
 
-The shared startup job downloads the GIBS capabilities metadata so its current
+The shared startup job checks expired GIBS capabilities metadata so its current
 visualization layers, dates, and render sizes are available in Settings. This
-metadata document is several megabytes; imagery pixels are requested only when
+metadata document is several megabytes. A complete catalogue checked within the
+previous 24 hours is reused without downloading it again; imagery pixels are requested only when
 NASA Worldview is selected or used by an active rotation profile. No NASA
 account or API key is required. MarbleScape requests the selected data layer
 without Worldview's separate map labels, borders, or coordinate overlays.

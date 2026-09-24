@@ -24,13 +24,14 @@ profile rotation, history, and local caching. The downloader also runs on Linux.
 - Current satellite imagery from seven source groups.
 - Natural-color or GeoColor defaults where the provider offers them.
 - Source-specific satellite, mission, area, layer, projection, date, and resolution controls.
-- Automatic source-resolution selection based on the configured output.
+- Automatic source-resolution selection based on connected displays when using multiple monitors.
 - Named image profiles with configurable rotation.
 - Latest-image storage, optional history, retention limits, and a profile cache.
 - Download and catalogue retries with progress, speed, size, and cancellation controls.
 - System-time or UTC timestamp display.
 - JSON backup and restore for configuration and profiles.
-- Windows tray operation, per-user startup, and automatic wallpaper placement.
+- Windows tray operation, single-instance startup, and per-monitor wallpaper placement.
+- A startup notice for new public GitHub releases, with a per-version skip option.
 
 Satellite observations are not seamless photographic maps. Depending on the
 provider and acquisition, imagery can contain clouds, scan seams, missing
@@ -41,7 +42,8 @@ inconsistent segments. See [Satellite imagery artifacts](docs/IMAGERY_ARTIFACTS.
 
 A reviewed prebuilt package supports 64-bit Windows 10 and 11.
 
-1. Download `MarbleScape-windows-x64.zip` and `SHA256SUMS.txt` from
+1. Download the versioned Windows archive (for example,
+   `MarbleScape-windows-x64_v1.3.0.zip`) and `SHA256SUMS.txt` from
    [GitHub Releases](https://github.com/Gittegatt/MarbleScape/releases).
 2. Verify the archive checksum and extract the complete ZIP to a user-writable folder.
 3. Run `marblescape.exe`.
@@ -106,17 +108,19 @@ Still-image sources default to GeoColor, GeoColour, natural color, or true color
 where available. Solar uses a wavelength channel because natural color does not
 apply to the Sun. Copernicus rendering requires a free Sentinel Hub OAuth client
 from the Copernicus Data Space account settings.
+New Copernicus settings select Sentinel-2 Mosaics, Sentinel-2 Quarterly Mosaics,
+and True Color Cloudless. Saved selections stay as configured.
 
 Provider-specific satellites, missions, layers, projections, coverage modes,
-cloud filtering, lookback behavior, and selection matrices are documented in
+cloud filtering, mosaic brightness, lookback behavior, and selection matrices are documented in
 [Image source guide](docs/IMAGE_SOURCES.md).
 
 ## Settings overview
 
 Settings contains these tabs:
 
-- **General** - Wallpaper, display time zone, and update timing.
-- **Image** - Source selection, image updates, framing, and output.
+- **General** - Wallpaper, display time zone, update timing, output device, and output size.
+- **Image** - Source selection, image updates, and framing.
 - **Download** - Transfer display, download retries, and catalogue retries.
 - **Profiles & Rotation** - Saved Image configurations and rotation timing.
 - **Storage & History** - Latest folder, History, retention, cache, and storage status.

@@ -294,6 +294,9 @@ class NOAAClient:
             DOWNLOAD_PROGRESS.raise_if_cancelled()
         _checked_url(url)
         request_headers = {"User-Agent": self.user_agent, "Cache-Control": "no-cache"}
+        cache = getattr(self, "metadata_cache", None) if not track else None
+        if cache:
+            request_headers.update(cache.headers(url))
         request_headers.update(headers or {})
         request = urllib.request.Request(url, headers=request_headers)
         try:
@@ -309,10 +312,18 @@ class NOAAClient:
                     body = read_response(response, limit, track=track)
                 except ResponseTooLargeError:
                     raise NOAAError("NOAA response exceeds the permitted download size.")
-                return body, dict(response.headers.items())
+                response_headers = dict(response.headers.items())
+                if cache:
+                    cache.store(url, body, response_headers)
+                return body, response_headers
         except urllib.error.HTTPError as exc:
             if exc.code == 304:
-                return None, dict(exc.headers.items())
+                if cache and (saved := cache.response(url, limit)) is not None:
+                    exc.close()
+                    return saved
+                response_headers = dict(exc.headers.items())
+                exc.close()
+                return None, response_headers
             raise UnavailableError("NOAA request failed (HTTP %s): %s" % (exc.code, url)) from exc
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise UnavailableError("NOAA is currently unreachable: %s" % exc) from exc

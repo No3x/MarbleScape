@@ -11,15 +11,17 @@ from tkinter import ttk
 from marblescape_catalogues import CatalogueClient
 from marblescape_catalogue_activity import CatalogueActivity
 from marblescape_noaa import NOAAClient
-from marblescape_copernicus import DEFAULT_PROFILE as DEFAULT_COPERNICUS_PROFILE, normalize_profile as normalize_copernicus_profile
+from marblescape_copernicus import (
+    DEFAULT_PROFILE as DEFAULT_COPERNICUS_PROFILE,
+    normalize_profile as normalize_copernicus_profile,
+)
 from marblescape_copernicus_settings import CopernicusSettings
 from marblescape_eumetsat import (
-    DEFAULT_PROFILE as DEFAULT_EUMETSAT_PROFILE,
     EumetsatSettings,
     normalize_profile as normalize_eumetsat_profile,
 )
 from marblescape_source_layout import SOURCE_COMBO_WIDTH, configure_source_columns
-from marblescape_worldview import DEFAULT_PROFILE as DEFAULT_WORLDVIEW_PROFILE
+from marblescape_source_defaults import default_source_profiles
 
 
 PROVIDER_LABELS = {
@@ -48,16 +50,7 @@ def image_source_label(provider):
     return IMAGE_SOURCE_CHOICES["goes"] if provider in GOES_SATELLITES else IMAGE_SOURCE_CHOICES[provider]
 
 
-DEFAULT_PROFILES = {
-    "eumetsat": dict(DEFAULT_EUMETSAT_PROFILE),
-    "goes_east": {"area": "full_disk", "product": "GEOCOLOR", "resolution": "auto"},
-    "goes_west": {"area": "full_disk", "product": "GEOCOLOR", "resolution": "auto"},
-    "solar": {"area": "sun", "product": "Fe171", "resolution": "auto"},
-    "himawari": {"area": "nict_full_disk", "product": "true_color", "resolution": "auto"},
-    "slider": {"area": "goes-19---full_disk", "product": "geocolor", "resolution": "auto"},
-    "copernicus": dict(DEFAULT_COPERNICUS_PROFILE),
-    "worldview": dict(DEFAULT_WORLDVIEW_PROFILE),
-}
+DEFAULT_PROFILES = default_source_profiles()
 
 CATALOGUE_PROVIDERS = frozenset(
     ("goes_east", "goes_west", "solar", "himawari", "slider", "worldview")
@@ -427,13 +420,13 @@ class SourceSettings:
         )
         self._resolution_hint.configure(
             text=("Each CIRA source size selects a tile-pyramid level. Larger levels retain more detail "
-                  "but require more separate tile downloads. Automatic selects the smallest useful level."
+                  "but require more separate tile downloads. Automatic uses active monitors in a multi-display setup."
                   if self._provider == "slider" else
                   "NASA GIBS renders the selected global layer at this size. The output size and image "
-                  "placement are configured below; Automatic selects the smallest useful size."
+                  "placement are configured under General > Output. Automatic uses active monitors in a multi-display setup."
                   if self._provider == "worldview" else
                   "Larger source images retain more detail when zooming or cropping. "
-                  "Automatic follows Output, fit/crop and zoom. Desktop size is set below; "
+                  "Automatic uses active monitors in a multi-display setup, plus fit/crop and zoom. "
                   "Render quality controls EUMETSAT WMS supersampling.")
         )
         if is_copernicus:
@@ -444,15 +437,37 @@ class SourceSettings:
         if self._provider == "eumetsat":
             self._loading = False
             status = getattr(self._client, "catalogue_refresh_status", {}) or {}
-            self.eumetsat_settings.refresh(not bool(status.get("running")))
+            use_cache = getattr(self._client, "catalogue_cached_for_automatic_use", None)
+            cached = callable(use_cache) and use_cache("eumetsat")
+            self.eumetsat_settings.refresh(not bool(status.get("running")) and not cached)
             return
         if not is_catalogue:
             self._loading = False
             self._refresh_button.configure(state="disabled")
             return
         self._show_saved_profile()
-        status = getattr(self._client, "catalogue_refresh_status", {}) or {}
-        self._load_areas(refresh=not bool(status.get("running")))
+        if not self._show_cached_catalogue():
+            status = getattr(self._client, "catalogue_refresh_status", {}) or {}
+            self._load_areas(refresh=not bool(status.get("running")))
+
+    def _show_cached_catalogue(self):
+        cached_areas = getattr(self._client, "cached_areas", None)
+        cached_products = getattr(self._client, "cached_products", None)
+        if not callable(cached_areas) or not callable(cached_products):
+            return False
+        areas = cached_areas(self._provider)
+        if not areas:
+            return False
+        self._receive_areas(areas, refresh=False, request_products=False)
+        profile = self._profiles[self._provider]
+        if not any(item["id"] == profile["area"] for item in areas):
+            return True
+        products = cached_products(self._provider, profile["area"])
+        if products:
+            self._receive_products(products)
+            return True
+        self._load_products(refresh=False)
+        return True
 
     def _show_saved_profile(self):
         profile = self._profiles[self._provider]
@@ -509,11 +524,13 @@ class SourceSettings:
         threading.Thread(target=worker, name="MarbleScape-catalogue", daemon=True).start()
 
     def _load_areas(self, refresh=False):
-        self._category_combo.configure(state="disabled")
-        self._filter_entry.configure(state="disabled")
-        self._area_combo.configure(state="disabled")
-        self._product_combo.configure(state="disabled")
-        self._resolution_combo.configure(state="disabled")
+        if not self._areas:
+            self._category_combo.configure(state="disabled")
+            self._filter_entry.configure(state="disabled")
+            self._area_combo.configure(state="disabled")
+        if not self._products:
+            self._product_combo.configure(state="disabled")
+            self._resolution_combo.configure(state="disabled")
         self._request("areas", refresh=refresh)
 
     def _advance_generation(self):
@@ -525,14 +542,18 @@ class SourceSettings:
         )
 
     def _load_products(self, refresh=False):
-        self._products = []
-        self._product_by_label = {}
         profile = self._profiles[self._provider]
-        self._product_var.set(profile.get("product", ""))
-        resolution = profile.get("resolution", "")
-        self._resolution_var.set("Largest available" if resolution == "largest" else resolution)
-        self._product_combo.configure(state="disabled")
-        self._resolution_combo.configure(state="disabled")
+        if not self._products or not self._usable[self._provider]:
+            self._products = []
+            self._product_by_label = {}
+            self._product_var.set(profile.get("product", ""))
+            resolution = profile.get("resolution", "")
+            self._resolution_var.set(
+                "Automatic (recommended)" if resolution == "auto" else
+                "Largest available" if resolution == "largest" else resolution
+            )
+            self._product_combo.configure(state="disabled")
+            self._resolution_combo.configure(state="disabled")
         self._request("products", refresh=refresh, area_id=profile["area"])
 
     def _poll(self):
@@ -593,7 +614,7 @@ class SourceSettings:
         # Including IDs keeps duplicate location/product names distinguishable.
         return {f"{item['label']} [{item['id']}]": item for item in items}
 
-    def _receive_areas(self, areas, refresh):
+    def _receive_areas(self, areas, refresh, request_products=True):
         if not areas:
             noun = "layers" if self._provider == "worldview" else "areas"
             raise ValueError(f"No {noun} are currently listed for this source.")
@@ -619,10 +640,20 @@ class SourceSettings:
             self._catalogue_activity.finish(False)
             self._refresh_button.configure(state="normal", text="Refresh catalogue")
             return
+        if not request_products:
+            return
         self._catalogue_activity.set_progress(1, 2)
         # CIRA and NASA publish areas and products in one catalogue document.
         # The area request above already refreshed it; rereading it here can
         # trigger a second slow network transfer for the same button click.
+        offline = getattr(self._client, "catalogue_offline", None)
+        if callable(offline) and offline(self._provider):
+            cached_products = getattr(self._client, "cached_products", None)
+            products = cached_products(self._provider, profile["area"]) \
+                if callable(cached_products) else None
+            if products:
+                self._receive_products(products)
+                return
         self._load_products(refresh=refresh and self._provider not in ("slider", "worldview"))
 
     def _filter_areas(self, *_args):
@@ -899,7 +930,8 @@ class SourceSettings:
         self._all_status_label.grid()
         self._all_progress.grid()
         if self._provider in CATALOGUE_PROVIDERS:
-            self._load_areas(refresh=False)
+            if not self._show_cached_catalogue():
+                self._load_areas(refresh=False)
 
     def _sync_global_refresh(self):
         """Observe startup/other-dialog jobs using a copied, thread-safe status."""
@@ -938,7 +970,8 @@ class SourceSettings:
             if was_running:
                 self._stop_all_progress(not error)
             if was_running and self._provider in CATALOGUE_PROVIDERS:
-                self._load_areas(refresh=False)
+                if not self._show_cached_catalogue():
+                    self._load_areas(refresh=False)
             elif was_running and self._provider == "eumetsat":
                 self.eumetsat_settings.refresh(False)
 

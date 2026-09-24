@@ -72,7 +72,7 @@ check time. Usage is shown in MB, switching to GB at 1,000 MB. Estimates use
 the saved, active configuration and current image size; unsaved edits do not
 affect them. Time-based retention estimates assume a new image each cycle.
 
-Settings is organized into eight tabs:
+Settings is organized into nine tabs:
 
 - **General:** Wallpaper, global display time zone, and Updates.
 - **Image:** Source, source-specific image selection, Force loading new picture, View, and Output.
@@ -83,10 +83,14 @@ Settings is organized into eight tabs:
 - **Backup:** JSON import and export.
 - **Sources:** Clickable links to the satellite imagery viewers used by MarbleScape,
   grouped by provider. Technical API and data endpoints are not listed there.
+- **Info:** Workflow and satellite imagery guidance.
 - **About:** Installed version, project link, imagery notice, and a manual GitHub update check.
 
-The update check contacts GitHub only when the button is pressed and compares
-the installed version with the newest public release or tag. A private
+At tray startup, MarbleScape checks the newest public GitHub release without
+delaying image updates. When it is newer than the installed version, a small
+window offers **Skip this version** and **Open GitHub**. Skipping is stored in
+the configuration and applies only to that version. The About tab also has a
+manual check for the newest public release or tag. A private
 repository cannot be checked by the application without GitHub authentication;
 in that case About reports that no public version is accessible and the project
 button can still open the repository in the user's signed-in browser.
@@ -122,6 +126,19 @@ invalid requests and authentication errors are reported without retrying.
 **Catalogue retries** independently sets 1-9 retries after the first metadata
 request. If every catalogue attempt fails, MarbleScape uses the most recent
 catalogue data stored in `content/catalogues.json` when available.
+At startup, MarbleScape checks public catalogues in the background. Complete
+NOAA, Himawari, CIRA SLIDER, NASA Worldview, and EUMETSAT catalogues saved
+within the previous 24 hours are reused without another metadata request.
+Expired sources are checked separately. After an unsuccessful check, MarbleScape
+waits one hour before another automatic attempt when a complete cache is
+available. Manual catalogue refreshes still check online immediately.
+The latest image is checked separately on each image update. For
+catalogue pages that provide an ETag or Last-Modified value, it uses a
+conditional request and reuses unchanged responses from
+`content/catalogue_http.json`. Sources without these validators still require
+a full metadata response. Copernicus checks only dates since the latest cached
+date, including a 14-day overlap for late additions. A manual Copernicus
+catalogue refresh still checks the complete available date range.
 **Cancel download** is enabled in
 the fixed footer while an image transfer can still be stopped. Cancelling keeps
 the current wallpaper, discards the unfinished result, and creates no History
@@ -149,7 +166,28 @@ where the provider offers one. Sources that use another name default to the
 closest natural or true-color product. Solar remains on its wavelength product
 because GeoColor does not apply to the Sun.
 
-**General > Output**, directly below **Updates**, provides wallpaper resolution and aspect-ratio
+**General > Output device** lists connected monitors. Choose **All monitors** to
+set the default Output values, then choose a display to set its own size, aspect
+ratio, render quality, background color, and position. These values are saved by
+monitor ID. If a display is disconnected, MarbleScape keeps its settings but
+does not apply a wallpaper to it. The same display receives its saved settings
+on the next wallpaper update after reconnection. **Do not update (keep current
+wallpaper)** skips future updates for that display and leaves its current image
+in place. **Restore previous wallpaper** immediately restores the image
+MarbleScape saved before it first replaced the wallpaper on the selected
+display and then stops future updates for that display. The saved copy is kept in
+`content/previous_wallpapers`. If MarbleScape had already replaced the wallpaper
+before this feature was installed, the older image cannot be recovered. For a
+Windows slideshow, the saved copy is the image visible when MarbleScape first
+updates the display, not the slideshow itself. Windows uses one system-wide
+placement mode, so
+switching to per-display placement may change how an existing wallpaper on a
+skipped display is scaled. Individual render quality can only use detail already
+present in the shared downloaded image. A display's background color fills
+placement margins; background already rendered into the shared image remains
+unchanged.
+
+**General > Output** provides wallpaper resolution and aspect-ratio
 presets. Selecting a preset fills the editable width, height, and ratio
 fields; choose `Custom` or edit those fields directly for another size.
 The NOAA, Himawari, or CIRA SLIDER source resolution controls the downloaded image, while **General > Output**
@@ -166,9 +204,14 @@ every download will finish: large transfers take longer and can be interrupted
 by the image server, a network timeout, or a connection reset. If this happens
 repeatedly, select a smaller source resolution and try again.
 
-**Automatic (recommended)** is the default source/render resolution. It chooses
-the smallest advertised image that can satisfy the configured Output size,
-fit/crop mode, and zoom without enlarging the visible source pixels. When no
+**Automatic (recommended)** is the default source/render resolution. With two
+or more connected monitors, it uses the largest width and height needed by the
+monitors receiving a wallpaper, including any larger per-monitor Output size.
+This covers mixed landscape and portrait setups. A monitor set to **Do not update
+(keep current wallpaper)** does not count. With one monitor, it uses the
+configured Output size as before. The
+smallest advertised source that satisfies this target, fit/crop mode, and zoom
+is selected without enlarging visible source pixels. When no
 exact size exists it selects the next sufficient size; when no listed size is
 large enough it uses the largest one. Manual sizes and **Largest available**
 remain selectable. This reduces bandwidth, memory use, and provider load while
@@ -183,9 +226,10 @@ discards changes made since the last Apply.
 
 Image **Fit mode** determines framing inside the generated output file:
 `fit` retains the view, while `crop` fills the output and trims edges.
-General > Wallpaper > **Position** applies Windows' center, tile, stretch,
-fit, fill, or span mode to that finished file. These modes can look identical
-when the file already matches the desktop dimensions. A position change uses
+General > Output > **Position** offers center, tile, stretch, fit, fill, span,
+and **Do not update (keep current wallpaper)** for the selected output device.
+MarbleScape prepares a monitor-sized image when positions differ between
+displays. A position change uses
 the existing local latest image without requesting a new source image or image
 URL. It also works when the source is temporarily unavailable and leaves the
 regular image-check schedule intact.
@@ -317,7 +361,7 @@ and `resolution`.
 For Worldview, `area` is the GIBS layer ID and `product` is `latest` or a
 fixed date offered by that layer.
 `sources.copernicus` stores its catalogue selection, date, location, zoom,
-maximum cloud cover, and map options; `[copernicus]` stores its OAuth Client ID
+maximum cloud cover, mosaic brightness, and map options; `[copernicus]` stores its OAuth Client ID
 and protected secret. Switching providers retains each source's settings.
 The `[download]` table stores the optional speed, size, percentage,
 progress-bar, and completed-status retention preferences.

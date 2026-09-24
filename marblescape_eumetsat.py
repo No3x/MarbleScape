@@ -17,6 +17,7 @@ from tkinter import ttk
 
 from marblescape_catalogue_activity import CatalogueActivity
 from marblescape_source_layout import SOURCE_COMBO_WIDTH, configure_source_columns
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 
@@ -297,12 +298,26 @@ class EumetsatCatalogueClient:
         self.catalogue_warning = ""
 
     def _json_get(self, url):
+        cache = getattr(self, "metadata_cache", None)
+        headers = {"User-Agent": self.user_agent, "Accept": "application/json"}
+        if cache:
+            headers.update(cache.headers(url))
         request = Request(
             url,
-            headers={"User-Agent": self.user_agent, "Accept": "application/json"},
+            headers=headers,
         )
-        with urlopen(request, timeout=self.timeout) as response:
-            return json.loads(_read_limited(response).decode("utf-8-sig"))
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                body = _read_limited(response)
+                if cache:
+                    cache.store(url, body, dict(response.headers.items()))
+        except HTTPError as exc:
+            saved = cache.response(url, MAX_CATALOGUE_BYTES) if exc.code == 304 and cache else None
+            exc.close()
+            if saved is None:
+                raise
+            body, _headers = saved
+        return json.loads(body.decode("utf-8-sig"))
 
     def _search(self):
         body = json.dumps({
